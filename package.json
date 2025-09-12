@@ -13,5 +13,8 @@
   "type": "commonjs",
   "devDependencies": {
     "playwright": "^1.55.0"
+  },
+  "dependencies": {
+    "chalk": "^4.1.2"
   }
 }
