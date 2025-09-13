@@ -1,40 +1,48 @@
-# 🕵️ DataDome Network Capture with Playwright
+# dd-playwright-open-any-website
 
-This project is a **Playwright-based CLI tool** that lets you capture and analyze how websites protected by [DataDome](https://datadome.co) respond to your requests.  
-It produces a clear narrative of:
-
-- What happens on the **initial request** (authorized `200` or blocked `403`)
-- If **blocked**, which **challenge steps** are triggered (Device Check and/or CAPTCHA/BLOCK)
-- Whether a **DataDome cookie** is set on any response
-- Your **external request IP** and **User-Agent**
-- A full **HAR file** and **cookie jar** for each session
+> Playwright-based network capture tool with **DataDome focus**.  
+> Captures **Document/XHR/Fetch** requests (no static assets), extracts **DataDome cookies**, **x-datadome-clientid** headers, challenge flows (**Device Check / CAPTCHA / Block**), and saves full HAR + cookies for analysis.
 
 ---
 
-## 📦 Features
+## ✨ Features
 
-- Interactive CLI with numeric menus:
-  - Browser: Chromium / Firefox / WebKit
-  - Headless mode: Yes / No
-  - User-Agent: default or custom string
-- Auto-finish on **network idle** (no manual input required)
-- **Network Requests section**:
-  - Shows only Document / XHR / Fetch requests
-  - Always displays DataDome `Set-Cookie` values for main and challenge requests
-- **Artifacts saved** for each session:
-  - `HAR` file (all captured requests & responses)
-  - `Cookies` JSON file (final cookie jar)
-- Robust `Set-Cookie` parsing
-- External **Request IP** captured via Chromium (using CDP)
+- **Multi-browser engine support**
+  - Chromium, Firefox, WebKit (select at launch).
+- **Custom or predefined User-Agents**
+  - Enter your own UA string.
+  - Use built-in **DD UA Test Codes**:
+    - `BLOCKUA` → CAPTCHA
+    - `BLOCKUAHARDBLOCKUA` → CAPTCHA > Block
+    - `HARDBLOCK` → Block
+    - `HARDBLOCK_UA` → Block (cross-origin XHR only)
+    - `DeviceCheckTestUA` → Device Check
+    - `DeviceCheckTestUA-BLOCKUA` → Device Check > CAPTCHA
+    - `DeviceCheckTestUA-HARDBLOCK` → Device Check > Block
+- **Initial request & redirects**
+  - Shows full **DataDome Set-Cookie** value if present.
+- **Network capture (Document/XHR/Fetch only)**
+  - Excludes static assets (CSS/JS/fonts/images/etc.).
+  - Logs:
+    - Request method, URL, status (colored).
+    - **DataDome Set-Cookie** values (response).
+    - **datadome cookie** value (request).
+    - **x-datadome-clientid** header (request).
+    - Payloads (query params for GET, parsed body for POST).
+- **Sequential event tracking**
+  - On `403 DOCUMENT`, logs the **next request** inline (Device Check / CAPTCHA / Block) with details.
+  - Prevents duplication of that next request.
+- **HAR + cookies export**
+  - Full `.har` with embedded content.
+  - Cookies JSON for session replay.
 
 ---
 
-## 🚀 Installation
+## 🚀 Usage
 
-Clone this repo and install dependencies:
+### 1. Install
 
 ```bash
-git clone https://github.com/your-repo/datadome-playwright-capture.git
-cd datadome-playwright-capture
+git clone https://github.com/inkkonito/dd-playwright-open-any-website-debug.git
+cd dd-playwright-open-any-website-debug
 npm install
-npx playwright install
