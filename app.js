@@ -1,486 +1,622 @@
 #!/usr/bin/env node
-/* app.js — DataDome capture with colored logs
-   - URL prompt loops until valid
-   - Numeric prompts (browser 0/1/2, headless 0/1)
-   - UA prompt: "0" (default), "1" (then ask), or paste UA directly
-   - Hard UA replacement (context, headers, route, navigator)
-   - Capture only Document/XHR/Fetch
-   - Run Recap: Egress IP + UA (colored)
-   - Network Requests:
-       → Requested main doc (with full DataDome cookie attributes if 200/403)
-       → HTTP 403 incidents after initial request (no duplication of main doc)
-       → Subsequent requests after initial request (ALWAYS shown): method, full URL, payloads, cookies, and DD phase (Device Check/CAPTCHA/BLOCK)
-   - HAR + cookies saved per session
-   - Colors via chalk (CommonJS-compatible: use chalk@4)
-*/
+/* eslint-disable no-console */
+
+// ===== Imports =====
 const { chromium, firefox, webkit } = require('playwright');
-const readline = require('readline');
+const pc = require('picocolors');                  // color
+const setCookie = require('set-cookie-parser');    // robust Set-Cookie parsing
+const { parse: tldParse } = require('tldts');      // URL host validation
 const fs = require('fs');
 const path = require('path');
-const chalk = require('chalk');
+const readline = require('readline');
+const https = require('https');
 
+// ===== Constants =====
+const WATCHDOG_IDLE_MS = 5000;           // network idle window (ms)
+const HARD_WATCHDOG_MS = 180000;         // hard stop after 3 min
+const HAR_DIR = path.join(process.cwd(), 'har');
+
+// ===== Helpers =====
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-const ask = (q) => new Promise((resolve) => rl.question(q, (a) => resolve(a.trim())));
+const ask = (q) => new Promise(res => rl.question(q, (a) => res(a.trim())));
 
-const APP_DIR = path.resolve(__dirname);
-const APP_HAR_ROOT = path.join(APP_DIR, 'har');
-const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/* Tunables */
-const QUIET_MS = 5000;           // time with no inflight requests to consider "idle"
-const MAX_CAPTURE_MS = 120000;   // absolute cap per run (safety)
-const ALLOWED_TYPES = new Set(['document','xhr','fetch']);
-const MAX_RAW_BODY_CHARS = 4000; // bound for raw POST bodies
+const iconForStatus = (s) => {
+  if (s == null) return pc.cyan('ℹ️');
+  if (s >= 200 && s < 300) return pc.green('✅');
+  if (s >= 300 && s < 400) return pc.cyan('ℹ️');
+  if (s === 403) return pc.red('🚫');
+  if (s >= 400) return pc.yellow('⚠️');
+  return pc.cyan('ℹ️');
+};
 
-/* Helpers */
-function clearScreen(){ process.stdout.write('\x1Bc'); }
-function pad2(n){ return String(n).padStart(2,'0'); }
-function ts(d=new Date()){
-  return `${d.getFullYear()}${pad2(d.getMonth()+1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
-}
-function sanitize(s){ return s.replace(/[^a-z0-9._-]+/gi,'_').slice(0,120); }
-function ensureDir(p){ if(!fs.existsSync(p)) fs.mkdirSync(p,{ recursive:true }); }
-function normalizeUrl(input){ try{ const has=/^https?:\/\//i.test(input); return new URL(has?input:`https://${input}`).toString(); }catch{ return null; } }
-function writeJSONAtomic(file, obj){ const tmp=file+'.tmp'; fs.writeFileSync(tmp, JSON.stringify(obj,null,2)); fs.renameSync(tmp,file); }
-function statusIcon(s){ return s===403?chalk.red('🚫 403'):s===200?chalk.green('✅ 200'):chalk.yellow(`ℹ️ ${s}`); }
+const niceType = (t) => {
+  const up = String(t || '').toUpperCase();
+  if (up === 'DOCUMENT') return pc.bold(pc.white('DOCUMENT'));
+  if (up === 'XHR')      return pc.bold(pc.white('XHR'));
+  if (up === 'FETCH')    return pc.bold(pc.white('FETCH'));
+  return up;
+};
 
-/* Query params pretty-printer */
-function prettyQueryParams(urlStr){
-  try{
-    const u = new URL(urlStr);
-    if (![...u.searchParams].length) return null;
-    const obj={};
-    for(const [k,v] of u.searchParams.entries()){
-      if(obj[k]===undefined) obj[k]=v;
-      else if(Array.isArray(obj[k])) obj[k].push(v);
-      else obj[k]=[obj[k],v];
-    }
-    return JSON.stringify(obj,null,2);
-  }catch{ return null; }
-}
+const isDocXhrFetch = (rt) => ['document', 'xhr', 'fetch'].includes(String(rt || '').toLowerCase());
+const colorUrl = (u) => pc.white(u);
+const ensureDir = (p) => { fs.mkdirSync(p, { recursive: true }); };
 
-/* Set-Cookie parsing */
-function splitSetCookieValue(v){
-  if(!v) return [];
-  if(Array.isArray(v)) return v;
-  if(typeof v==='string') return v.includes('\n')?v.split('\n'):[v];
-  return [];
-}
-function parseSetCookie(raw){
-  raw=(raw||'').trim(); if(!raw) return null;
-  const parts=raw.split(';');
-  const nv=(parts.shift()||'').trim();
-  const eq=nv.indexOf('=');
-  if(eq<=0) return null;
-  const name=nv.slice(0,eq).trim();
-  const value=nv.slice(eq+1).trim();
+const extractDDCookies = (anySetCookieValues) => {
+  if (!anySetCookieValues) return [];
+  const pieces = [];
+  const pushSplit = (val) => {
+    if (!val) return;
+    const split = setCookie.splitCookiesString(val); // handles commas in Expires
+    for (const s of split) pieces.push(s);
+  };
+  if (Array.isArray(anySetCookieValues)) for (const v of anySetCookieValues) pushSplit(v);
+  else if (typeof anySetCookieValues === 'string') pushSplit(anySetCookieValues);
 
-  const attrs={};
-  for(const p of parts){
-    const seg=p.trim(); if(!seg) continue;
-    const i=seg.indexOf('=');
-    if(i===-1){
-      const key=seg.toLowerCase();
-      if(key==='secure') attrs.Secure=true;
-      else if(key==='httponly') attrs.HttpOnly=true;
-      else attrs[seg]=true;
-    } else {
-      const k=seg.slice(0,i).trim(), v=seg.slice(i+1).trim(), key=k.toLowerCase();
-      if(key==='domain') attrs.Domain=v;
-      else if(key==='path') attrs.Path=v;
-      else if(key==='expires') attrs.Expires=v;
-      else if(key==='max-age') attrs['Max-Age']=v;
-      else if(key==='samesite') attrs.SameSite=v;
-      else attrs[k]=v;
-    }
+  const parsed = setCookie.parse(pieces, { map: false });
+  return parsed
+    .filter(c => (c.name || '').toLowerCase() === 'datadome')
+    .map(h => ({
+      name: h.name,
+      value: h.value,
+      domain: h.domain,
+      path: h.path,
+      sameSite: h.sameSite,
+      secure: !!h.secure,
+      httpOnly: !!h.httpOnly,
+      maxAge: h.maxAge,
+      expires: h.expires
+    }));
+};
+
+const showDDSetCookies = (dd) => {
+  if (!dd || dd.length === 0) return;
+  console.log(`   ${pc.yellow('🍪 DataDome Set-Cookie:')}`);
+  for (const c of dd) {
+    console.log(`     - ${pc.white(`${c.name}=${c.value}`)}`);
+    const attrs = [];
+    if (c.maxAge != null) attrs.push(`Max-Age=${c.maxAge}`);
+    if (c.domain) attrs.push(`Domain=${c.domain}`);
+    if (c.path) attrs.push(`Path=${c.path}`);
+    if (c.secure) attrs.push('Secure');
+    if (c.httpOnly) attrs.push('HttpOnly');
+    if (c.sameSite) attrs.push(`SameSite=${c.sameSite}`);
+    if (c.expires) attrs.push(`Expires=${new Date(c.expires).toUTCString()}`);
+    if (attrs.length) console.log(`     ${pc.dim('•')} ${attrs.join(' ')}\n`);
   }
-  return {name,value,attrs};
-}
-function extractDDDetailed(setCookies){
-  const out=[];
-  for(const sc of setCookies||[]){
-    const parsed=parseSetCookie(sc);
-    if(parsed && /^datadome$/i.test(parsed.name)) out.push(parsed);
+};
+
+const parseQueryParams = (urlObj) => {
+  const out = {};
+  for (const [k, v] of urlObj.searchParams.entries()) {
+    if (out[k] == null) out[k] = v;
+    else if (Array.isArray(out[k])) out[k].push(v);
+    else out[k] = [out[k], v];
   }
   return out;
-}
-function extractDDFromHeadersObject(headersObj){
-  const v=headersObj&&headersObj['set-cookie'];
-  return extractDDDetailed(splitSetCookieValue(v));
-}
-function formatCookieLine(c){
-  const base=chalk.yellow(`${c.name}=${c.value}`);
-  const attrs=[];
-  for(const [k,v] of Object.entries(c.attrs||{})){
-    attrs.push(v===true?k:`${k}=${v}`);
-  }
-  return attrs.length?`${base}\n       ${chalk.gray(attrs.join(' • '))}`:base;
-}
-function classifyDD(url){
-  if (/\/interstitial\//i.test(url)) return 'Device Check';
-  if (/\/captcha\//i.test(url))      return 'CAPTCHA/BLOCK';
-  return null;
-}
+};
 
-/* Detect egress IP (public IP) via same browser context */
-async function detectEgressIP(page){
-  try{
-    const ip6 = await page.evaluate(()=>fetch('https://api64.ipify.org?format=json',{cache:'no-store'}).then(r=>r.json()).then(j=>j.ip).catch(()=>null));
-    if (ip6) return ip6;
-    const ip4 = await page.evaluate(()=>fetch('https://api.ipify.org?format=json',{cache:'no-store'}).then(r=>r.json()).then(j=>j.ip).catch(()=>null));
-    return ip4 || 'N/A';
-  }catch{ return 'N/A'; }
-}
+const safeJSON = (v) => {
+  try { return JSON.stringify(v, null, 2); } catch { return String(v); }
+};
 
-/* Pretty POST body */
-function prettyPostBody(body,contentType=''){
-  if(!body) return null;
-  const ct=(contentType||'').toLowerCase();
-  if(ct.includes('application/json')){
-    try{ return JSON.stringify(JSON.parse(body),null,2); }catch{}
+const decodeIfForm = (contentType, body) => {
+  if (!body) return { bodyKind: 'unknown', bodyOut: body };
+  const ct = String(contentType || '').toLowerCase();
+  if (ct.includes('application/json')) {
+    try { return { bodyKind: 'json', bodyOut: JSON.stringify(JSON.parse(body), null, 2) }; }
+    catch { return { bodyKind: 'json', bodyOut: body }; }
   }
-  if(ct.includes('application/x-www-form-urlencoded')){
-    try{
-      const params=new URLSearchParams(body);
-      const obj={};
-      for(const [k,v] of params.entries()){
-        if(obj[k]===undefined) obj[k]=v;
-        else if(Array.isArray(obj[k])) obj[k].push(v);
-        else obj[k]=[obj[k],v];
+  if (ct.includes('application/x-www-form-urlencoded')) {
+    const params = {};
+    for (const part of String(body).split('&')) {
+      const [k, v=''] = part.split('=');
+      params[decodeURIComponent(k)] = decodeURIComponent(v);
+    }
+    return { bodyKind: 'form', bodyOut: JSON.stringify(params, null, 2) };
+  }
+  return { bodyKind: 'unknown', bodyOut: body };
+};
+
+const getExternalIP = () => new Promise((resolve) => {
+  const req = https.get('https://api.ipify.org?format=json', (res) => {
+    let data = '';
+    res.on('data', (c) => data += c);
+    res.on('end', () => {
+      try {
+        const obj = JSON.parse(data);
+        resolve(obj.ip || 'unknown');
+      } catch {
+        resolve('unknown');
       }
-      return JSON.stringify(obj,null,2);
-    }catch{}
+    });
+  });
+  req.on('error', () => resolve('unknown'));
+  req.setTimeout(3000, () => { req.destroy(); resolve('unknown'); });
+});
+
+const normalizeURL = (raw) => {
+  try {
+    let s = String(raw || '').trim();
+    if (!s) return null;
+    if (!/^https?:\/\//i.test(s)) s = `https://${s}`;
+    const u = new URL(s);
+    const tp = tldParse(u.hostname || '');
+    if (!tp || !tp.domain) return null;
+    return u.toString();
+  } catch {
+    return null;
   }
-  return body.length>MAX_RAW_BODY_CHARS
-    ? body.slice(0,MAX_RAW_BODY_CHARS)+`…[+${body.length-MAX_RAW_BODY_CHARS} chars]`
-    : body;
-}
+};
 
-async function main(){
-  clearScreen();
-  console.log(chalk.cyan.bold('🔎 Playwright Launcher\n'));
+// ===== Main =====
+async function main() {
+  ensureDir(HAR_DIR);
 
-  // URL (loop until valid)
-  let url;
-  while (true) {
-    const urlIn = await ask('Which website do you want to open? ');
-    url = normalizeUrl(urlIn);
-    if (url) break;
-    console.log(chalk.red('❌ Invalid URL. Please try again.\n'));
-  }
+  console.log(pc.bold(pc.cyan('🔎 Playwright Launcher\n')));
 
-  // Browser
-  console.log('\nChoose browser:\n  0) Chromium\n  1) Firefox\n  2) WebKit');
-  const bRaw = await ask('Enter number (default: 0): ');
-  const bIdx = Number(bRaw);
-  const browserType = [chromium, firefox, webkit][(Number.isNaN(bIdx)||bIdx<0||bIdx>2)?0:bIdx];
-  const browserName = ['Chromium','Firefox','WebKit'][(Number.isNaN(bIdx)||bIdx<0||bIdx>2)?0:bIdx];
+  // Browser choice
+  console.log(`Browser:
+  ${pc.bold('0)')} Chromium
+  ${pc.bold('1)')} Firefox
+  ${pc.bold('2)')} WebKit`);
+  let bNum = await ask(pc.dim('Enter number (default: 0): '));
+  if (!/^[0-2]$/.test(bNum)) bNum = '0';
+  const browserKind = ['chromium','firefox','webkit'][Number(bNum)];
 
   // Headless
-  console.log('\nHeadless:\n  0) No\n  1) Yes');
-  const hRaw = await ask('Enter number (default: 0): ');
-  const headless = (hRaw==='1');
+  console.log(`\nHeadless:
+  ${pc.bold('0)')} No
+  ${pc.bold('1)')} Yes`);
+  let hNum = await ask(pc.dim('Enter number (default: 0): '));
+  if (!/^[0-1]$/.test(hNum)) hNum = '0';
+  const headless = hNum === '1';
 
-  // UA (accept "0", "1" then ask, or paste a UA directly)
-  console.log('\nUser-Agent:\n  0) (default)\n  1) Custom\n  (or paste UA string directly)');
-  const uRaw = await ask('Enter number or UA string (default: 0): ');
-  let ua = null;
-  if (uRaw === '1') {
-    const custom = await ask('Enter full UA string: ');
-    ua = (custom || '').trim() || null;
-  } else if (uRaw && uRaw !== '0') {
-    ua = uRaw.trim();
+  // UA
+  console.log(`\nUser-Agent:
+  ${pc.bold('0)')} (default)
+  ${pc.bold('1)')} Custom`);
+  let uaNum = await ask(pc.dim('Enter number (default: 0): '));
+  if (!/^[0-1]$/.test(uaNum)) uaNum = '0';
+  let customUA = '';
+  if (uaNum === '1') {
+    customUA = await ask(pc.dim('Enter custom User-Agent string: '));
   }
 
-  // Session paths
-  ensureDir(APP_HAR_ROOT);
-  const baseName = `${ts()}_${sanitize(new URL(url).host)}`;
-  const APP_SESSION = path.join(APP_HAR_ROOT, baseName);
-  ensureDir(APP_SESSION);
+  // Finish mode
+  console.log(`\nFinish mode:
+  ${pc.bold('0)')} Auto (network idle + 5s)
+  ${pc.bold('1)')} Manual (press Enter)`);
+  let fNum = await ask(pc.dim('Enter number (default: 0): '));
+  if (!/^[0-1]$/.test(fNum)) fNum = '0';
+  const manualFinish = fNum === '1';
 
-  const harFinal     = path.join(APP_SESSION, `${baseName}.har`);
-  const harTemp      = harFinal + '.tmp';
-  const cookiesFinal = path.join(APP_SESSION, `${baseName}.cookies.json`);
-  const cookiesTemp  = cookiesFinal + '.tmp';
+  // URL ask (loop until valid)
+  let startURL = null;
+  while (!startURL) {
+    const raw = await ask(pc.bold('\nWhich website do you want to open? '));
+    const normalized = normalizeURL(raw);
+    if (!normalized) {
+      console.log(pc.red('❌ Invalid URL. Please try again (example: leboncoin.fr or https://leboncoin.fr).'));
+    } else {
+      startURL = normalized;
+    }
+  }
 
-  // Launch & context
-  const browser = await browserType.launch({ headless });
-  const ctxOpts = { recordHar: { path: harTemp, omitContent: false } };
-  if (ua) ctxOpts.userAgent = ua; // context UA
-  const context = await browser.newContext(ctxOpts);
+  // Gather external IP
+  const egressIP = await getExternalIP();
 
-  // Extra headers for UA (belt and suspenders)
-  if (ua) await context.setExtraHTTPHeaders({ 'user-agent': ua });
+  // Session folder (within /har)
+  const hostForName = new URL(startURL).hostname.replace(/^www\./,'');
+  const stamp = new Date().toISOString().replace(/[-:]/g,'').slice(0,15);
+  const sessionDir = path.join(HAR_DIR, `${stamp}_${hostForName}`);
+  ensureDir(sessionDir);
+  const harPath = path.join(sessionDir, `${stamp}_${hostForName}.har`);
+  const cookiesPath = path.join(sessionDir, `${stamp}_${hostForName}.cookies.json`);
 
-  // Page
+  // Launch
+  const b = { chromium, firefox, webkit }[browserKind];
+  const launch = await b.launch({ headless });
+  const context = await launch.newContext({
+    userAgent: customUA || undefined,
+    recordHar: { path: harPath, mode: 'minimal' },
+  });
   const page = await context.newPage();
 
-  // Align JS-visible UA + neutralize Client Hints
-  if (ua) {
-    await context.addInitScript((forcedUA) => {
-      try { Object.defineProperty(navigator, 'userAgent', { get: () => forcedUA }); } catch {}
-      try { Object.defineProperty(navigator, 'userAgentData', { get: () => undefined }); } catch {}
-    }, ua);
-  }
+  // CDP extras (Chromium only): capture raw Set-Cookie from ExtraInfo
+  const isChromium = browserKind === 'chromium';
+  /** requestId -> { url, method, status, setCookieStrings[] } */
+  const cdpById = new Map();
+  if (isChromium) {
+    const cdp = await context.newCDPSession(page);
+    await cdp.send('Network.enable', { extraInfoSpec: ['IncludeExtraInfo'] });
 
-  // HARD header replacement via routing — affects ALL requests (nav + XHR/fetch)
-  if (ua) {
-    await context.route('**/*', async (route) => {
-      const req = route.request();
-      const headers = { ...(await req.headers()) };
-      headers['user-agent'] = ua;
+    cdp.on('Network.requestWillBeSent', (evt) => {
+      const { requestId, request } = evt || {};
+      if (!requestId || !request) return;
+      const rec = cdpById.get(requestId) || { setCookieStrings: [] };
+      rec.url = request.url;
+      rec.method = request.method || 'GET';
+      cdpById.set(requestId, rec);
+    });
 
-      // Strip CH headers that could contradict the UA
-      delete headers['sec-ch-ua'];
-      delete headers['sec-ch-ua-mobile'];
-      delete headers['sec-ch-ua-platform'];
-      delete headers['sec-ch-ua-platform-version'];
-      delete headers['sec-ch-ua-arch'];
-      delete headers['sec-ch-ua-model'];
-      delete headers['sec-ch-ua-bitness'];
-      delete headers['sec-ch-ua-full-version'];
-      delete headers['sec-ch-ua-full-version-list'];
+    cdp.on('Network.responseReceived', (evt) => {
+      const { requestId, response } = evt || {};
+      if (!requestId || !response) return;
+      const rec = cdpById.get(requestId) || { setCookieStrings: [] };
+      rec.status = response.status;
+      if (!rec.url) rec.url = response.url;
+      cdpById.set(requestId, rec);
+    });
 
-      await route.continue({ headers });
+    cdp.on('Network.responseReceivedExtraInfo', (evt) => {
+      const { requestId, headers } = evt || {};
+      if (!requestId) return;
+      const rec = cdpById.get(requestId) || { setCookieStrings: [] };
+      // headers["set-cookie"] may be string or array; normalize
+      const h = headers || {};
+      const sc = h['set-cookie'] ?? h['Set-Cookie'];
+      if (Array.isArray(sc)) rec.setCookieStrings.push(...sc);
+      else if (typeof sc === 'string') rec.setCookieStrings.push(sc);
+      cdpById.set(requestId, rec);
     });
   }
 
-  // Egress IP + actual UA observed on the wire (main request)
-  const egressIP = await detectEgressIP(page);
-  let mainUA = null;
-  page.on('request', async (req) => {
-    try {
-      if (!mainUA && req.isNavigationRequest?.() && req.frame()===page.mainFrame()) {
-        const hdrs = await req.allHeaders?.() || {};
-        mainUA = hdrs['user-agent'] || mainUA;
-      }
-    } catch {}
-  });
+  // Recap
+  console.log('\n' + pc.bold(pc.magenta('🧾 Run Recap')));
+  console.log(`  Timestamp : ${pc.white(new Date().toISOString())}`);
+  console.log(`  URL       : ${pc.white(startURL)}`);
+  console.log(`  Browser   : ${pc.white(browserKind[0].toUpperCase() + browserKind.slice(1))}`);
+  console.log(`  Headless  : ${pc.white(headless ? 'Yes' : 'No')}`);
+  console.log(`  Egress IP : ${pc.white(egressIP)}`);
+  console.log(`  User-Agent: ${pc.white(customUA || '(default)')}`);
+  console.log(`  Session   : ${pc.white(sessionDir)}`);
+  console.log(`  HAR       : ${pc.white(harPath)}`);
+  console.log(`  Cookies   : ${pc.white(cookiesPath)}`);
+  console.log(`  Finish    : ${pc.white(manualFinish ? 'manual (press Enter)' : 'auto on network idle + 5s')}\n`);
 
-  // Collection
-  const entries = []; // {url,status,type,isMain,ddCookiesDetailed,ddPhase,t0,method,reqCT,postBodyPretty,queryPretty}
-  let mainNavResponse = null;
+  // Filters
+  const targetHost = new URL(startURL).hostname.toLowerCase();
+  const challengeHost = 'geo.captcha-delivery.com';
 
-  page.on('response', async (res)=>{
-    try{
-      const req = res.request();
-      const type = req.resourceType?.() || 'other';
-      if (!ALLOWED_TYPES.has(type)) return;
+  // Capture arrays
+  const events = []; // our printed list (doc/xhr/fetch on target/challenge)
+  let reqIdx = 0;
 
-      const method = req.method?.() || 'GET';
-      let reqHeaders = {};
-      try { reqHeaders = await req.headers?.() || {}; } catch {}
-      const reqCT = (reqHeaders['content-type'] || reqHeaders['Content-Type'] || '').toString();
+  // Also collect “document” request order for better initial redirect rendering
+  const docEvents = [];
 
-      let postBodyPretty = null;
-      if (method === 'POST') {
-        try {
-          const body = (typeof req.postData === 'function') ? (req.postData() || '') : '';
-          postBodyPretty = prettyPostBody(body, reqCT);
-        } catch {}
-      }
+  // Request listener
+  page.on('request', (req) => {
+    const rt = req.resourceType();
+    if (!isDocXhrFetch(rt)) return;
 
-      const urlStr = res.url();
-      const queryPretty = prettyQueryParams(urlStr);
+    const url = req.url();
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
 
-      // DataDome cookies with attributes
-      let ddDetailed = [];
+    if (host !== targetHost && host !== challengeHost && !host.endsWith('.' + targetHost)) return;
+
+    const idx = ++reqIdx;
+    const method = req.method();
+    const type = rt;
+    const reqHeaders = req.headers() || {};
+
+    const cookieHeader = reqHeaders['cookie'] || reqHeaders['Cookie'];
+    let ddReqCookie = '';
+    if (cookieHeader) {
       try {
-        if (typeof res.headerValues === 'function') {
-          const hv = await res.headerValues('set-cookie');
-          ddDetailed = extractDDDetailed(hv);
-        } else {
-          const hs = res.headers?.() || {};
-          ddDetailed = extractDDFromHeadersObject(hs);
+        const cookies = cookieHeader.split(/;\s*/).map(x => x.trim());
+        for (const c of cookies) {
+          const [k, ...rest] = c.split('=');
+          if (k.toLowerCase() === 'datadome') {
+            ddReqCookie = rest.join('=');
+            break;
+          }
         }
       } catch {}
+    }
+    const ddReqHeader = reqHeaders['x-datadome-clientid'] || reqHeaders['X-DataDome-ClientId'];
 
-      entries.push({
-        url: urlStr,
-        status: res.status(),
-        type,
-        isMain: (req.isNavigationRequest?.() && req.frame()===page.mainFrame()) || false,
-        ddCookiesDetailed: ddDetailed,
-        ddPhase: classifyDD(urlStr),
-        t0: Date.now(),
-        method,
-        reqCT,
-        postBodyPretty,
-        queryPretty
-      });
-    }catch{}
+    let reqBody = undefined;
+    try {
+      const post = req.postData();
+      if (post) reqBody = post;
+    } catch {}
+
+    const ev = {
+      idx, ts: Date.now(), url, method, type, status: null,
+      reqHeaders, resHeaders: {}, reqBody, ddReqCookie, ddReqHeader, ddSetCookies: []
+    };
+    events.push(ev);
+    if (type === 'document') docEvents.push(ev);
   });
 
-  // Network idle logic
-  let finishRequested=false, idleTimer=null, inflight=0;
-  function armIdleTimer(){
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(()=>{
-      console.log(chalk.gray(`\n📴 Network idle ${QUIET_MS/1000}s — finishing`));
-      finishRequested = true;
-    }, QUIET_MS);
+  // Response listener
+  page.on('response', async (res) => {
+    try {
+      const req = res.request();
+      const rt = req.resourceType();
+      if (!isDocXhrFetch(rt)) return;
+
+      const url = req.url();
+      const u = new URL(url);
+      const host = u.hostname.toLowerCase();
+      if (host !== targetHost && host !== challengeHost && !host.endsWith('.' + targetHost)) return;
+
+      const status = res.status();
+
+      // Map back to our event (same url & method, last with null status)
+      const ev = [...events].reverse().find(e => e.url === url && e.status == null && e.method === req.method());
+      if (ev) {
+        ev.status = status;
+
+        // Try standard header APIs first
+        let resHeaders = {};
+        let ddSetCookies = [];
+        try {
+          if (typeof res.headersArray === 'function') {
+            const arr = res.headersArray(); // [{name,value}]
+            const scStrings = [];
+            for (const { name, value } of arr) {
+              const key = name.toLowerCase();
+              if (key === 'set-cookie') scStrings.push(value);
+              if (resHeaders[key] == null) resHeaders[key] = value;
+              else if (Array.isArray(resHeaders[key])) resHeaders[key].push(value);
+              else resHeaders[key] = [resHeaders[key], value];
+            }
+            ddSetCookies = extractDDCookies(scStrings);
+          } else {
+            const obj = res.headers() || {};
+            const scRaw = [];
+            for (const [k, v] of Object.entries(obj)) {
+              const key = k.toLowerCase();
+              if (key === 'set-cookie') {
+                if (Array.isArray(v)) scRaw.push(...v);
+                else scRaw.push(v);
+              }
+              resHeaders[key] = v;
+            }
+            ddSetCookies = extractDDCookies(scRaw);
+          }
+        } catch {
+          try {
+            const obj = res.headers() || {};
+            const scRaw = [];
+            const v = obj['set-cookie'] || obj['Set-Cookie'];
+            if (v) {
+              if (Array.isArray(v)) scRaw.push(...v);
+              else scRaw.push(v);
+            }
+            resHeaders = obj;
+            ddSetCookies = extractDDCookies(scRaw);
+          } catch {}
+        }
+        ev.resHeaders = resHeaders;
+        ev.ddSetCookies = ddSetCookies;
+
+        // If still no Set-Cookie and Chromium, try CDP ExtraInfo (authoritative)
+        if (isChromium && (!ev.ddSetCookies || ev.ddSetCookies.length === 0)) {
+          // find a CDP entry with same URL+method and status if known
+          const matches = [];
+          for (const rec of cdpById.values()) {
+            if (!rec.url || !rec.method) continue;
+            if (rec.url === ev.url && rec.method === ev.method && (rec.status == null || rec.status === ev.status)) {
+              matches.push(rec);
+            }
+          }
+          // prefer last
+          const m = matches[matches.length - 1];
+          if (m && m.setCookieStrings && m.setCookieStrings.length) {
+            ev.ddSetCookies = extractDDCookies(m.setCookieStrings);
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+  });
+
+  // Start navigation
+  console.log(pc.dim(`Launching browser… capturing network. ${manualFinish ? 'Interact if needed.' : ''}`));
+  await page.goto(startURL, { waitUntil: 'domcontentloaded' }).catch(() => null);
+
+  // Wait strategy
+  if (manualFinish) {
+    console.log(pc.dim('Press Enter here when you want to finish capture…'));
+    await Promise.race([
+      ask(''),
+      (async () => { await sleep(HARD_WATCHDOG_MS); })()
+    ]);
+  } else {
+    await page.waitForLoadState('networkidle', { timeout: HARD_WATCHDOG_MS }).catch(() => {});
+    await sleep(WATCHDOG_IDLE_MS);
   }
-  page.on('request',        ()=>{ inflight++; if (idleTimer) { clearTimeout(idleTimer); idleTimer=null; } });
-  page.on('requestfinished',()=>{ inflight=Math.max(0,inflight-1); if (inflight===0) armIdleTimer(); });
-  page.on('requestfailed',  ()=>{ inflight=Math.max(0,inflight-1); if (inflight===0) armIdleTimer(); });
 
-  // Navigate & wait
-  await page.goto(url, { waitUntil:'domcontentloaded', timeout:30000 }).catch(()=>{});
-  armIdleTimer();
-
-  const start=Date.now();
-  while(!finishRequested){
-    if ((Date.now()-start)>MAX_CAPTURE_MS) { console.log(chalk.red('\n⏱️ Max capture time reached')); break; }
-    await sleep(250);
+  // Persist cookies
+  try {
+    const cookies = await context.cookies();
+    fs.writeFileSync(cookiesPath, JSON.stringify(cookies, null, 2));
+  } catch {
+    fs.writeFileSync(cookiesPath, JSON.stringify({ note: 'no cookies captured' }, null, 2));
   }
 
-  // Main doc
-  const mains = entries.filter(e=>e.isMain && e.type==='document').sort((a,b)=>a.t0-b.t0);
-  mainNavResponse = mains.length ? mains[mains.length-1] : null;
-
-  const actualUA = mainUA || ua || '(browser default)';
-
-  // Recap
-  clearScreen();
-  console.log(chalk.cyan.bold('🧾 Run Recap'));
-  console.log(`  ${chalk.white('Timestamp')}: ${new Date().toISOString()}`);
-  console.log(`  ${chalk.white('URL')}: ${chalk.green(url)}`);
-  console.log(`  ${chalk.white('Browser')}: ${browserName}`);
-  console.log(`  ${chalk.white('Headless')}: ${headless ? chalk.green('Yes') : chalk.red('No')}`);
-  console.log(`  ${chalk.white('Egress IP')}: ${chalk.magenta(egressIP)}`);
-  console.log(`  ${chalk.white('User-Agent')}: ${chalk.yellow(actualUA)}`);
-  console.log(`  ${chalk.white('Session')}: ${APP_SESSION}`);
-  console.log(`  ${chalk.white('HAR')}: ${harFinal}`);
-  console.log(`  ${chalk.white('Cookies')}: ${cookiesFinal}`);
-  console.log(`  ${chalk.white('Finish')}: auto on network idle + ${QUIET_MS/1000}s\n`);
-
-  // Save artifacts
-  try{
-    const [state, jar] = await Promise.all([context.storageState(), context.cookies()]);
-    writeJSONAtomic(cookiesTemp, { url, timestamp:new Date().toISOString(), storageState: state, cookies: jar });
-    if (fs.existsSync(cookiesTemp)) fs.renameSync(cookiesTemp, cookiesFinal);
-  }catch{}
   await context.close().catch(()=>{});
-  if (fs.existsSync(harTemp)) fs.renameSync(harTemp, harFinal);
+  await launch.close().catch(()=>{});
+  rl.close();
 
-  // Output
-  console.log(chalk.cyan.bold('📖 Network Requests'));
-
-  // Requested (main)
-  if (mainNavResponse) {
-    console.log(`${chalk.bold('→ Requested:')} ${chalk.green(mainNavResponse.url)} [${statusIcon(mainNavResponse.status)}]`);
-    if ((mainNavResponse.status===200 || mainNavResponse.status===403) && mainNavResponse.ddCookiesDetailed?.length) {
-      console.log(chalk.yellow('   🍪 DataDome Set-Cookie:'));
-      for (const c of mainNavResponse.ddCookiesDetailed) {
-        console.log('     - ' + formatCookieLine(c));
+  // ===== Merge CDP Set-Cookie for any remaining events (belt & suspenders) =====
+  // ^ we won’t re-use CDP here if not Chromium, but leaving constant as true wouldn’t hurt prints below.
+  // To be precise, skip if not chromium:
+  if (browserKind === 'chromium') {
+    for (const ev of events) {
+      if (ev.ddSetCookies && ev.ddSetCookies.length) continue;
+      const candidates = [];
+      for (const rec of cdpById.values()) {
+        if (rec.url === ev.url && rec.method === ev.method) candidates.push(rec);
+      }
+      const last = candidates[candidates.length - 1];
+      if (last && last.setCookieStrings && last.setCookieStrings.length) {
+        ev.ddSetCookies = extractDDCookies(last.setCookieStrings);
       }
     }
+  }
+
+  // ===== PRINT RESULTS =====
+
+  // Initial request & redirects
+  console.log('\n' + pc.bold(pc.cyan('📍 Initial request & redirects')));
+  const docOnTarget = docEvents.filter(d => {
+    const host = new URL(d.url).hostname.toLowerCase();
+    return host === targetHost || host.endsWith('.' + targetHost);
+  }).sort((a,b)=>a.idx-b.idx);
+
+  if (docOnTarget.length === 0) {
+    console.log(pc.dim('   (No initial response captured.)'));
   } else {
-    console.log(chalk.red('→ Requested: (no main document)'));
-  }
+    const first = docOnTarget[0];
+    const icn = iconForStatus(first.status);
+    console.log(`→ Requested: ${colorUrl(first.url)} [${icn} ${first.status ?? ''}]`);
+    if (first.ddSetCookies && first.ddSetCookies.length) showDDSetCookies(first.ddSetCookies);
+    else console.log(pc.dim('   No DataDome Set-Cookie on this response.'));
 
-  // 403 incidents AFTER main request (exclude only the exact main doc entry)
-  const incidents403 = entries
-    .filter(e =>
-      e.status === 403 &&
-      ALLOWED_TYPES.has(e.type) &&
-      (!mainNavResponse || e !== mainNavResponse)
-    )
-    .sort((a,b)=> a.t0 - b.t0);
-
-  if (incidents403.length) {
-    console.log(chalk.red.bold('\n❗ HTTP 403 incidents after initial request:'));
-    let idx = 1;
-    for (const inc of incidents403) {
-      const scope = inc.isMain ? 'Main' : 'Subrequest';
-      console.log(`  ${idx++}. [${scope}] ${chalk.white(inc.type.toUpperCase())} (${chalk.blue(inc.method)}) → ${chalk.green(inc.url)} [${statusIcon(inc.status)}]`);
-
-      if (inc.queryPretty && inc.method === 'GET') {
-        console.log(chalk.gray('     ↳ Query params:'));
-        for (const line of inc.queryPretty.split('\n')) console.log(chalk.gray('       ' + line));
-      }
-      if (inc.method === 'POST' && inc.postBodyPretty) {
-        console.log(chalk.gray(`     ↳ Body (${inc.reqCT || 'unknown'}):`));
-        for (const line of inc.postBodyPretty.split('\n')) console.log(chalk.gray('       ' + line));
-      }
-      if (inc.ddCookiesDetailed?.length) {
-        console.log(chalk.yellow('     🍪 DataDome Set-Cookie:'));
-        for (const c of inc.ddCookiesDetailed) console.log('       - ' + formatCookieLine(c));
-      }
-
-      // Subsequent challenge steps (Device Check / CAPTCHA/BLOCK) after this 403
-      const seq = entries
-        .filter(e => e.t0 >= inc.t0 && e.ddPhase)
-        .sort((a,b)=> a.t0 - b.t0);
-
-      if (seq.length) {
-        console.log(chalk.cyan('     Subsequent challenge steps:'));
-        let step=1;
-        for (const e of seq) {
-          console.log(`       ${step++}. ${chalk.magenta(e.ddPhase)} (${chalk.blue(e.method)}) → ${chalk.green(e.url)} [${statusIcon(e.status)}]`);
-
-          if (e.method === 'GET' && e.queryPretty) {
-            console.log(chalk.gray('          ↳ Query params:'));
-            for (const line of e.queryPretty.split('\n')) console.log(chalk.gray('            ' + line));
-          }
-          if (e.method === 'POST' && e.postBodyPretty) {
-            console.log(chalk.gray(`          ↳ Body (${e.reqCT || 'unknown'}):`));
-            for (const line of e.postBodyPretty.split('\n')) console.log(chalk.gray('            ' + line));
-          }
-          if (e.ddCookiesDetailed?.length) {
-            console.log(chalk.yellow('          🍪 DataDome Set-Cookie:'));
-            for (const c of e.ddCookiesDetailed) console.log('            - ' + formatCookieLine(c));
-          }
-        }
-      }
-    }
-  } else {
-    console.log(chalk.gray('\n(No HTTP 403 incidents after initial request.)'));
-  }
-
-  // ALWAYS show all subsequent requests (Document/XHR/Fetch) after initial request
-  if (mainNavResponse) {
-    const subs = entries
-      .filter(e => ALLOWED_TYPES.has(e.type) && !(e.isMain && e.type==='document' && e === mainNavResponse))
-      .filter(e => e.t0 >= mainNavResponse.t0)  // include same-ms events
-      .sort((a,b)=> a.t0 - b.t0);
-
-    if (subs.length) {
-      console.log(chalk.cyan.bold('\n🔗 Subsequent requests after initial request:'));
-      let i=1;
-      for (const r of subs) {
-        const phase = r.ddPhase ? ` ${chalk.magenta('['+r.ddPhase+']')}` : '';
-        console.log(`  ${i++}. ${chalk.white(r.type.toUpperCase())} (${chalk.blue(r.method)}) → ${chalk.green(r.url)} [${statusIcon(r.status)}]${phase}`);
-
-        // Payload prints
-        if (r.method === 'GET' && r.queryPretty) {
-          console.log(chalk.gray('     ↳ Query params:'));
-          for (const line of r.queryPretty.split('\n')) console.log(chalk.gray('       ' + line));
-        }
-        if (r.method === 'POST' && r.postBodyPretty) {
-          console.log(chalk.gray(`     ↳ Body (${r.reqCT || 'unknown'}):`));
-          for (const line of r.postBodyPretty.split('\n')) console.log(chalk.gray('       ' + line));
-        }
-
-        // Any DataDome cookies on these responses
-        if (r.ddCookiesDetailed?.length) {
-          console.log(chalk.yellow('     🍪 DataDome Set-Cookie:'));
-          for (const c of r.ddCookiesDetailed) console.log('       - ' + formatCookieLine(c));
-        }
-      }
-    } else {
-      console.log(chalk.gray('\n(No subsequent Document/XHR/Fetch requests captured.)'));
+    if (docOnTarget.length >= 2) {
+      const second = docOnTarget[1];
+      console.log(`   ↪ redirected to: ${colorUrl(second.url)} [${iconForStatus(second.status)} ${second.status ?? ''}]`);
+      if (second.ddSetCookies && second.ddSetCookies.length) showDDSetCookies(second.ddSetCookies);
     }
   }
 
-  // Saved
-  console.log(chalk.cyan.bold('\n📦 Saved:'));
-  console.log(`  HAR:     ${chalk.green(harFinal)}`);
-  console.log(`  Cookies: ${chalk.green(cookiesFinal)}`);
-  console.log(chalk.green('\n✅ Done'));
+  // 2) Full network capture (target + challenge; only Document/XHR/Fetch)
+  events.sort((a,b) => a.idx - b.idx);
 
-  await browser.close().catch(()=>{});
-  process.exit(0);
+  console.log('\n' + pc.bold(pc.cyan('📦 Full network capture (Document/XHR/Fetch on target or challenge domains)')));
+
+  let shown = 0;
+  const skipInline = new Set(); // indices we already printed inline (avoid duplicate numbered rows)
+
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i];
+    if (skipInline.has(ev.idx)) continue; // suppress duplicates
+
+    const u = new URL(ev.url);
+    const host = u.hostname.toLowerCase();
+    const isChallenge = host === 'geo.captcha-delivery.com';
+
+    // Log
+    const statusIcon = iconForStatus(ev.status);
+    const method = ev.method || 'GET';
+    const typ = niceType(ev.type);
+    shown++;
+    const numStr = String(shown).padStart(3, ' ');
+    console.log(` ${numStr}. ${typ} (${method}) → ${colorUrl(ev.url)} [${statusIcon} ${ev.status ?? ''}]`);
+
+    // Always show DataDome Set-Cookie if present
+    if (ev.ddSetCookies && ev.ddSetCookies.length) {
+      showDDSetCookies(ev.ddSetCookies);
+    }
+
+    // Request-side data: x-datadome-clientid + datadome cookie
+    if (ev.ddReqCookie || ev.ddReqHeader) {
+      console.log(pc.yellow('     ↳ Request headers:'));
+      if (ev.ddReqHeader) {
+        console.log(`       x-datadome-clientid: ${pc.white(ev.ddReqHeader)}`);
+      }
+      if (ev.ddReqCookie) {
+        console.log(`       cookie: ${pc.white('datadome=')}${pc.white(ev.ddReqCookie)}`);
+      }
+    }
+
+    // Query params for GET-like
+    if (method === 'GET') {
+      const qp = parseQueryParams(u);
+      if (Object.keys(qp).length) {
+        console.log(pc.dim('     ↳ Query params:'));
+        console.log(pc.dim('       ' + safeJSON(qp).split('\n').join('\n       ')));
+      }
+    }
+
+    // Body for POST/PUT/PATCH etc
+    if (method !== 'GET' && ev.reqBody) {
+      const ct = ev.reqHeaders['content-type'] || ev.reqHeaders['Content-Type'] || '';
+      const { bodyKind, bodyOut } = decodeIfForm(ct, ev.reqBody);
+      console.log(pc.dim(`     ↳ Body (${bodyKind || 'unknown'}):`));
+      const lines = String(bodyOut).split('\n');
+      for (const ln of lines.slice(0, 400)) {
+        console.log(pc.dim('       ' + ln));
+      }
+      if (lines.length > 400) console.log(pc.dim('       … (truncated)'));
+    }
+
+    // If this was a 403, show the very next matching “challenge” request inline,
+    // and mark it as printed so we don't output it again as a numbered item.
+    if (ev.status === 403) {
+      const next = events[i+1];
+      if (next) {
+        const nHost = new URL(next.url).hostname.toLowerCase();
+        if (nHost === 'geo.captcha-delivery.com') {
+          const label = next.url.includes('/interstitial/') ? 'Device Check' : (next.url.includes('/captcha/') ? 'CAPTCHA/BLOCK' : 'Challenge');
+          console.log(`     ↪ Next request after 403: ${label} (${next.method || 'GET'}) → ${colorUrl(next.url)} [${iconForStatus(next.status)} ${next.status ?? ''}]`);
+
+          // Show its DataDome Set-Cookie if present
+          if (next.ddSetCookies && next.ddSetCookies.length) {
+            // indent inside inline block
+            const orig = console.log;
+            console.log = (...args) => orig('      ' + args.join(' '));
+            showDDSetCookies(next.ddSetCookies);
+            console.log = orig;
+          }
+
+          // Show request headers (x-datadome-clientid/datadome)
+          if (next.ddReqCookie || next.ddReqHeader) {
+            console.log(pc.yellow('       ↳ Request headers:'));
+            if (next.ddReqHeader) {
+              console.log(`         x-datadome-clientid: ${pc.white(next.ddReqHeader)}`);
+            }
+            if (next.ddReqCookie) {
+              console.log(`         cookie: ${pc.white('datadome=')}${pc.white(next.ddReqCookie)}`);
+            }
+          }
+
+          // Params/body
+          const nu = new URL(next.url);
+          const qpn = parseQueryParams(nu);
+          if (Object.keys(qpn).length) {
+            console.log(pc.dim('       ↳ Query params:'));
+            console.log(pc.dim('         ' + safeJSON(qpn).split('\n').join('\n         ')));
+          }
+          if ((next.method || 'GET') !== 'GET' && next.reqBody) {
+            const ctn = next.reqHeaders['content-type'] || next.reqHeaders['Content-Type'] || '';
+            const { bodyKind, bodyOut } = decodeIfForm(ctn, next.reqBody);
+            console.log(pc.dim(`       ↳ Body (${bodyKind || 'unknown'}):`));
+            const linesN = String(bodyOut).split('\n');
+            for (const ln of linesN.slice(0, 400)) {
+              console.log(pc.dim('         ' + ln));
+            }
+            if (linesN.length > 400) console.log(pc.dim('         … (truncated)'));
+          }
+
+          // avoid duplicate numbered row for this immediate challenge request
+          skipInline.add(next.idx);
+        }
+      }
+    }
+  }
+
+  if (shown === 0) {
+    console.log(pc.dim('(No matching requests were captured.)'));
+  }
+
+  console.log('\n' + pc.green('📦 Saved:'));
+  console.log(`  HAR:     ${pc.white(harPath)}`);
+  console.log(`  Cookies: ${pc.white(cookiesPath)}`);
+  console.log('\n' + pc.green('✅ Done'));
 }
 
-main().catch(e=>{ console.error(chalk.red('Unexpected error:'), e); process.exit(1); });
+// ===== Run =====
+main().catch(err => {
+  const red = (pc && typeof pc.red === 'function') ? pc.red : (x)=>x;
+  console.error(red('Unexpected error:'), err);
+  process.exit(1);
+});

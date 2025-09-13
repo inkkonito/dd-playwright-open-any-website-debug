@@ -15,6 +15,10 @@
     "playwright": "^1.55.0"
   },
   "dependencies": {
-    "chalk": "^4.1.2"
+    "chalk": "^4.1.2",
+    "colorette": "^2.0.20",
+    "picocolors": "^1.1.1",
+    "set-cookie-parser": "^2.7.1",
+    "tldts": "^7.0.14"
   }
 }
