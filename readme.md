@@ -1,48 +1,75 @@
-# dd-playwright-open-any-website
+# 🕵️‍♂️ dd-playwright-open-any-website
 
-> Playwright-based network capture tool with **DataDome focus**.  
-> Captures **Document/XHR/Fetch** requests (no static assets), extracts **DataDome cookies**, **x-datadome-clientid** headers, challenge flows (**Device Check / CAPTCHA / Block**), and saves full HAR + cookies for analysis.
+A **Playwright-based debugging tool** to open any website or API endpoint and **capture/analyze network traffic** with a focus on **anti-bot detection systems (like DataDome)**. The tool gives you full visibility into **sequential request flows**, **cookies**, and **headers**, so you can clearly see where challenges such as **Device Check** or **CAPTCHA/Block** are triggered.
 
 ---
 
 ## ✨ Features
-
-- **Multi-browser engine support**
-  - Chromium, Firefox, WebKit (select at launch).
-- **Custom or predefined User-Agents**
-  - Enter your own UA string.
-  - Use built-in **DD UA Test Codes**:
-    - `BLOCKUA` → CAPTCHA
-    - `BLOCKUAHARDBLOCKUA` → CAPTCHA > Block
-    - `HARDBLOCK` → Block
-    - `HARDBLOCK_UA` → Block (cross-origin XHR only)
-    - `DeviceCheckTestUA` → Device Check
-    - `DeviceCheckTestUA-BLOCKUA` → Device Check > CAPTCHA
-    - `DeviceCheckTestUA-HARDBLOCK` → Device Check > Block
-- **Initial request & redirects**
-  - Shows full **DataDome Set-Cookie** value if present.
-- **Network capture (Document/XHR/Fetch only)**
-  - Excludes static assets (CSS/JS/fonts/images/etc.).
-  - Logs:
-    - Request method, URL, status (colored).
-    - **DataDome Set-Cookie** values (response).
-    - **datadome cookie** value (request).
-    - **x-datadome-clientid** header (request).
-    - Payloads (query params for GET, parsed body for POST).
-- **Sequential event tracking**
-  - On `403 DOCUMENT`, logs the **next request** inline (Device Check / CAPTCHA / Block) with details.
-  - Prevents duplication of that next request.
-- **HAR + cookies export**
-  - Full `.har` with embedded content.
-  - Cookies JSON for session replay.
+- **Interactive setup (prompt-based)**
+  - Choose what to test:
+    - `GET document/API`
+    - `POST request with payload`
+  - Select browser engine: `Chromium`, `Firefox`, `WebKit`
+  - Run in `Headless` or `Headful` mode
+  - Select User-Agent:
+    - Default
+    - Custom
+    - Predefined **DD UA Test Codes**:
+      - `BLOCKUA = CAPTCHA`
+      - `BLOCKUAHARDBLOCKUA = CAPTCHA > Block`
+      - `HARDBLOCK = Block`
+      - `HARDBLOCK_UA = Block [Only on cross-origin XHR]`
+      - `DeviceCheckTestUA = Device Check`
+      - `DeviceCheckTestUA-BLOCKUA = Device Check > CAPTCHA`
+      - `DeviceCheckTestUA-HARDBLOCK = Device Check > Block`
+  - Select **network logging scope**:
+    - Same-domain only
+    - Cross-origin only
+    - Any origin
+  - Finish mode:
+    - Auto (network idle + 5s)
+    - Manual (press Enter)
+  - Enter URL (validated until correct, e.g. `leboncoin.fr` → `https://leboncoin.fr`)
 
 ---
 
-## 🚀 Usage
+## 📖 What Gets Logged
+### Run Recap
+- Timestamp
+- URL
+- What to test
+- Browser
+- Headless (Yes/No)
+- User-Agent
+- Egress IP (your outgoing IP detected live)
+- Network logging scope
+- Session folder
+- HAR file path
+- Cookies file path
+- Finish mode
 
-### 1. Install
+### Full Network Capture
+- **Only** logs requests of type: `Document`, `XHR`, `Fetch`
+- **Excludes static assets** (CSS, JS, fonts, images, videos, etc.)
+- **Always includes challenge domains** (`geo.captcha-delivery.com`):
+  - `/interstitial` → Device Check
+  - `/captcha` → CAPTCHA/Block
+- Each request displays:
+  - Method, URL, status code
+  - Classification (Document, XHR, Fetch, Device Check, CAPTCHA/Block)
+  - **Query params** (for GET requests)
+  - **Payload/body** (for POST/PUT/PATCH requests)
+  - **Request headers**:
+    - `x-datadome-clientid` if present
+  - **Request cookies**:
+    - Full `datadome` cookie if present
+  - **Response headers**:
+    - Full `datadome` Set-Cookie if present (with domain/path/flags)
 
-```bash
-git clone https://github.com/inkkonito/dd-playwright-open-any-website-debug.git
-cd dd-playwright-open-any-website-debug
-npm install
+### Saved Artifacts
+- HAR file (all network traffic)
+- Cookies JSON file (all browser cookies)
+
+---
+
+## 🖥️ Example Output

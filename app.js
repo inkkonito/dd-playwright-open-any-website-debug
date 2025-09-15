@@ -1,589 +1,635 @@
-// app.js
-// dd-playwright-open-any-website (enhanced logging + DataDome focus)
+// app.js — Playwright network debugger (CommonJS, single file)
+// Node 18+  |  npm i playwright  |  run: node app.js
+//
+// WHAT THIS DOES (exactly as requested):
+// - Single "Full network capture" section — no separate redirects section.
+// - Logs ONLY resource types: Document / XHR / Fetch (never scripts, css, images, fonts, etc).
+// - Excludes static assets by extension, always.
+// - Obeys scope filter: same-domain / cross-origin / any.
+// - ALWAYS includes geo.captcha-delivery.com requests (GET/POST), with query params (GET) or body (POST),
+//   and labels them "CAPTCHA/BLOCK" (/captcha) or "Device Check" (/interstitial).
+// - ALWAYS shows, when present:
+//   • Request header: x-datadome-clientid (full value)
+//   • Request Cookie: datadome=… (full value)
+//   • RESPONSE Set-Cookie: datadome=… (full value)
+// - If Playwright’s runtime APIs don’t expose Set-Cookie on navigation responses, we FALL BACK to the saved HAR
+//   and augment each printed line, so you WILL see the DataDome Set-Cookie exactly under the matching response line.
+// - Works on Chromium, Firefox, WebKit. Colorized output. Cross-platform console clear (best effort).
 
-const pc = require('picocolors');
-const { chromium, firefox, webkit, devices } = require('playwright');
-const readline = require('node:readline');
-const fs = require('node:fs');
-const path = require('node:path');
-const urlLib = require('node:url');
-const querystring = require('node:querystring');
-const setCookie = require('set-cookie-parser');
-const { parse: tldParse } = require('tldts');
+console.clear();
 
-// ========================= Colors & helpers =========================
-function cSection(t) { return pc.bold(pc.cyan(t)); }
-function cSubhead(t) { return pc.bold(pc.white(t)); }
-function cInfo(t) { return pc.white(t); }
-function cRedirect(t) { return pc.yellow(t); }
-function cOk(t) { return pc.bold(pc.green(t)); }
-function cBlock() { return pc.white(pc.bold(pc.bgRed('403'))); }
-function cStatus(n) {
-  if (n >= 200 && n < 300) return cOk(String(n));
-  if (n >= 300 && n < 400) return cRedirect(String(n));
-  if (n === 403) return cBlock();
-  return pc.bold(String(n));
-}
-function cDim(t) { return pc.dim(t); }
-function cURL(t) { return pc.bold(t); }
-function cCounter(n) { return pc.bold(pc.white(String(n))); }
-function cTag(t) {
-  if (/CAPTCHA/i.test(t)) return pc.bold(pc.magenta(t));
-  if (/Device Check/i.test(t)) return pc.bold(pc.blue(t));
-  if (/Block/i.test(t)) return pc.bold(pc.red(t));
-  return pc.bold(pc.cyan(t));
-}
-function cCookieKey(k) { return pc.italic(pc.cyan(k)); }
-function cCookieVal(v) { return pc.bold(pc.yellow(v)); }
-function cHeaderKey(k) { return pc.italic(pc.magenta(k)); }
-function cHeaderVal(v) { return pc.white(v); }
-function cWarn(t) { return pc.yellow(t); }
-function cError(t) { return pc.red(pc.bold(t)); }
+const fs = require("fs");
+const path = require("path");
+const readline = require("readline/promises");
+const { stdin: input, stdout: output } = require("node:process");
+const { chromium, firefox, webkit } = require("playwright");
 
-const EXTENSION_FILTER_RE = /\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|webm|webp|bmp|gif|ico|jpeg|jpg|png|svg|svgz|swf|eot|otf|ttf|woff|woff2|css|less|js|map)(\?|$)/i;
+/* ==============================
+   Colors (no deps)
+============================== */
+const C = {
+  reset: "\x1b[0m",
+  bold: (s) => `\x1b[1m${s}\x1b[0m`,
+  dim: (s) => `\x1b[2m${s}\x1b[0m`,
+  red: (s) => `\x1b[31m${s}\x1b[0m`,
+  green: (s) => `\x1b[32m${s}\x1b[0m`,
+  yellow: (s) => `\x1b[33m${s}\x1b[0m`,
+  blue: (s) => `\x1b[34m${s}\x1b[0m`,
+  magenta: (s) => `\x1b[35m${s}\x1b[0m`,
+  cyan: (s) => `\x1b[36m${s}\x1b[0m`,
+  gray: (s) => `\x1b[90m${s}\x1b[0m`,
+};
 
-const CHALLENGE_HOSTS = new Set([
-  'captcha-delivery.com',
-  'geo.captcha-delivery.com'
+/* ==============================
+   Constants / helpers
+============================== */
+// NEVER log static assets in the capture:
+const STATIC_EXT_RE =
+  /\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|webm|webp|bmp|gif|ico|jpeg|jpg|png|svg|svgz|swf|eot|otf|ttf|woff|woff2|css|less|js|map)(\?|#|$)/i;
+
+// Only these resource types are logged:
+const LOG_TYPES = new Set(["document", "xhr", "fetch"]);
+
+// DataDome / challenge related hosts (always include)
+const DD_HOSTS = new Set([
+  "geo.captcha-delivery.com",   // interstitial/captcha endpoints
+  "dd.prod.captcha-delivery.com",
+  "dd.immoscout24.ch",
 ]);
 
-// Paths → tags
-function challengeTagForURL(u) {
-  try {
-    const { hostname, pathname } = new urlLib.URL(u);
-    if (!hostname) return null;
-    const path = pathname || '';
-    if (/^\/interstitial\/?/i.test(path)) return 'Device Check';
-    if (/^\/captca\/?/i.test(path) || /^\/captcha\/?/i.test(path)) return 'CAPTCHA/BLOCK';
-  } catch { /* ignore */ }
-  return null;
+function pad2(n) {
+  const s = String(n);
+  return s.length >= 2 ? s : " " + s;
 }
-
-// truncate long URLs for single-line listing
-function truncUrl(u, max = 140) {
-  if (u.length <= max) return u;
-  return u.slice(0, max - 1) + '…';
-}
-
-function parseQueryParams(u) {
+function hostOf(u) {
   try {
-    const parsed = new urlLib.URL(u);
-    const obj = {};
-    for (const [k, v] of parsed.searchParams.entries()) obj[k] = v;
-    return obj;
+    return new URL(u).host;
+  } catch {
+    return "";
+  }
+}
+function originOf(u) {
+  try {
+    const { protocol, host } = new URL(u);
+    return `${protocol}//${host}`;
+  } catch {
+    return "";
+  }
+}
+function isStatic(url) {
+  return STATIC_EXT_RE.test(url);
+}
+function suffixBase(host) {
+  const parts = host.split(".");
+  if (parts.length < 2) return host;
+  return parts.slice(-2).join(".");
+}
+function sameDomain(uHost, baseHost) {
+  return uHost === baseHost || uHost.endsWith("." + baseHost);
+}
+function parseQuery(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    const o = {};
+    for (const [k, v] of u.searchParams.entries()) o[k] = v;
+    return o;
   } catch {
     return null;
   }
 }
+function j2(v) {
+  try {
+    return JSON.stringify(v, null, 2);
+  } catch {
+    return String(v);
+  }
+}
+function nowISO() {
+  return new Date().toISOString();
+}
+function ensureDir(p) {
+  fs.mkdirSync(p, { recursive: true });
+}
+function sanitizePart(s) {
+  return s.replace(/[^a-z0-9_.-]/gi, "_");
+}
+function classifyDD(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    if (u.hostname !== "geo.captcha-delivery.com") return null;
+    if (u.pathname.startsWith("/captcha")) return "CAPTCHA/BLOCK";
+    if (u.pathname.startsWith("/interstitial")) return "Device Check";
+    return "Challenge";
+  } catch {
+    return null;
+  }
+}
+function prettyType(rt, ddLabel) {
+  const up = rt.toUpperCase();
+  return ddLabel ? `${up} ${C.yellow(`[${ddLabel}]`)}` : up;
+}
+function prettyStatus(status) {
+  if (status >= 200 && status < 300) return `${C.green("✅")} ${status}`;
+  if (status === 403) return `${C.red("🚫")} 403`;
+  if (status >= 300 && status < 400) return `${C.blue("ℹ️")} ${status}`;
+  if (status === 0) return `${C.red("✖")} 0`;
+  return `${status}`;
+}
+function headerValueCase(headers, key) {
+  const lower = key.toLowerCase();
+  for (const k of Object.keys(headers || {})) {
+    if (k.toLowerCase() === lower) return headers[k];
+  }
+  return undefined;
+}
 
-function prettyPrintKV(obj, indent = '       ') {
-  const keys = Object.keys(obj || {});
-  if (!keys.length) return;
-  console.log(indent + cDim('{'));
-  keys.forEach((k, i) => {
-    console.log(indent + '  ' + pc.cyan(k) + cDim(': ') + pc.yellow(String(obj[k])));
+/**
+ * Robustly extract ALL Set-Cookie lines that contain datadome= from the response.
+ * Uses multiple fallbacks to handle Playwright version differences.
+ */
+function getDataDomeSetCookies(response) {
+  const hits = [];
+
+  // 1) headerValues("set-cookie") → array
+  try {
+    if (typeof response.headerValues === "function") {
+      const arr = response.headerValues("set-cookie") || [];
+      for (const v of arr) if (typeof v === "string" && /datadome=/i.test(v)) hits.push(v);
+      if (hits.length) return hits;
+    }
+  } catch {}
+
+  // 2) headersArray()
+  try {
+    const arr = typeof response.headersArray === "function" ? response.headersArray() : null;
+    if (Array.isArray(arr) && arr.length) {
+      for (const h of arr) {
+        if (h && typeof h.name === "string" && h.name.toLowerCase() === "set-cookie" && /datadome=/i.test(h.value || "")) {
+          hits.push(h.value);
+        }
+      }
+      if (hits.length) return hits;
+    }
+  } catch {}
+
+  // 3) headers() (lower-cased, may be compressed)
+  try {
+    const hobj = response.headers?.() || {};
+    const raw = hobj["set-cookie"];
+    if (!raw) return hits;
+    if (Array.isArray(raw)) {
+      for (const v of raw) if (typeof v === "string" && /datadome=/i.test(v)) hits.push(v);
+    } else if (typeof raw === "string") {
+      const parts = raw.split(/,(?=[^;]+?=)/g).map((s) => s.trim());
+      for (const p of parts) if (/datadome=/i.test(p)) hits.push(p);
+    }
+  } catch {}
+
+  return hits;
+}
+
+/* ==============================
+   Prompt helpers
+============================== */
+async function askChoice(rl, title, items, defIdx = 0) {
+  output.write(`\n${C.bold(title)}\n\n`);
+  items.forEach((label, i) => {
+    const def = i === defIdx ? " (default)" : "";
+    output.write(`  ${i}) ${label}${def}\n`);
   });
-  console.log(indent + cDim('}'));
+  const ans = await rl.question(`Enter number (default: ${defIdx}): `);
+  const n = ans.trim() === "" ? defIdx : Number(ans.trim());
+  return Number.isInteger(n) && n >= 0 && n < items.length ? n : defIdx;
 }
 
-function parseBody(request) {
-  const bodyText = request.postData() || '';
-  if (!bodyText) return null;
-  const headers = request.headers() || {};
-  const ct = headers['content-type'] || headers['Content-Type'] || '';
-  if (/application\/json/i.test(ct)) {
-    try { return JSON.parse(bodyText); } catch { return bodyText; }
-  }
-  if (/application\/x-www-form-urlencoded/i.test(ct)) {
-    try { return querystring.parse(bodyText); } catch { return bodyText; }
-  }
-  return bodyText;
-}
-
-function parseDataDomeFromSetCookie(headersArray) {
-  // headersArray: [{name, value}, ...]
-  const setCookies = headersArray.filter(h => h.name.toLowerCase() === 'set-cookie').map(h => h.value);
-  if (!setCookies.length) return null;
-  const parsed = setCookie.parse(setCookies, { map: false });
-  // look for datadome
-  for (const c of parsed) {
-    if (c && typeof c.name === 'string' && c.name.toLowerCase() === 'datadome') {
-      return {
-        value: c.value,
-        attributes: c
-      };
-    }
-  }
-  return null;
-}
-
-function printDataDome(dd, indent = '   ') {
-  if (!dd) return;
-  const attrsParts = [];
-  if (dd.attributes['Max-Age'] != null) attrsParts.push(pc.gray(`Max-Age=${dd.attributes['Max-Age']}`));
-  if (dd.attributes.Domain) attrsParts.push(pc.gray(`Domain=${dd.attributes.Domain}`));
-  if (dd.attributes.Path) attrsParts.push(pc.gray(`Path=${dd.attributes.Path}`));
-  if (dd.attributes.Secure) attrsParts.push(pc.gray('Secure'));
-  if (dd.attributes.SameSite) attrsParts.push(pc.gray(`SameSite=${dd.attributes.SameSite}`));
-  console.log(`${indent}${pc.bold('🍪 DataDome Set-Cookie:')}`);
-  console.log(`${indent}  ${cCookieKey('datadome')}=${cCookieVal(dd.value)}`);
-  if (attrsParts.length) console.log(`${indent}  • ${attrsParts.join(' ')}`);
-}
-
-function findDataDomeInCookieHeader(cookieHeader) {
-  if (!cookieHeader) return null;
-  // split cookies by '; ' pairs aware of semicolons within values? Simple approach works for this
-  // safer: parse with set-cookie-parser does not parse request cookies. We'll do manual:
-  const parts = cookieHeader.split(/;\s*/);
-  for (const p of parts) {
-    const [k, ...rest] = p.split('=');
-    if (!k) continue;
-    if (k.trim().toLowerCase() === 'datadome') {
-      return rest.join('=');
-    }
-  }
-  return null;
-}
-
-function normalizeInputURL(input) {
-  let s = (input || '').trim();
-  if (!s) return '';
-  if (!/^https?:\/\//i.test(s)) s = 'https://' + s;
-  return s;
-}
-
-function toRegistrable(hostname) {
-  try {
-    const info = tldParse(hostname, { allowPrivateDomains: true });
-    // Prefer the full domain when available
-    return info.domain || hostname || '';
-  } catch {
-    return hostname || '';
-  }
-}
-
-function isStaticAsset(u) {
-  try {
-    const { pathname } = new urlLib.URL(u);
-    return EXTENSION_FILTER_RE.test(pathname);
-  } catch {
-    return false;
-  }
-}
-
-function isDocumentLike(request) {
-  const t = request.resourceType();
-  return t === 'document';
-}
-
-function isXHRorFetch(request) {
-  const t = request.resourceType();
-  return t === 'xhr' || t === 'fetch';
-}
-
-function isOnTargetOrChallenge(host, targetDomain) {
-  if (!host) return false;
-  const reg = toRegistrable(host);
-  if (reg.endsWith(targetDomain)) return true;
-  // challenge/ecosystem
-  for (const ch of CHALLENGE_HOSTS) {
-    if (reg.endsWith(ch)) return true;
-  }
-  return false;
-}
-
-// ========================= Prompt UI =========================
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-
-function ask(question) {
-  return new Promise((resolve) => rl.question(question, (ans) => resolve(ans)));
-}
-
-const UA_TEST_CODES = {
-  'BLOCKUA': 'BLOCKUA',
-  'BLOCKUAHARDBLOCKUA': 'BLOCKUAHARDBLOCKUA',
-  'HARDBLOCK': 'HARDBLOCK',
-  'HARDBLOCK_UA': 'HARDBLOCK_UA',
-  'DeviceCheckTestUA': 'DeviceCheckTestUA',
-  'DeviceCheckTestUA-BLOCKUA': 'DeviceCheckTestUA-BLOCKUA',
-  'DeviceCheckTestUA-HARDBLOCK': 'DeviceCheckTestUA-HARDBLOCK',
-};
-
-async function promptUser() {
-  console.clear()
-  console.log(pc.bold(pc.cyan('🔎 Playwright Launcher\n')));
-
-  // Browser
-  console.log('Browser:');
-  console.log('  0) Chromium');
-  console.log('  1) Firefox');
-  console.log('  2) WebKit');
-  const b = (await ask('\nEnter number (default: 0): ')).trim() || '0';
-  const browserKind = ({ '0': 'chromium', '1': 'firefox', '2': 'webkit' }[b] || 'chromium');
-
-  // Headless
-  console.log('\nHeadless:');
-  console.log('  0) No');
-  console.log('  1) Yes');
-  const h = (await ask('Enter number (default: 0): ')).trim() || '0';
-  const headless = (h === '1');
-
-  // User-Agent
-  console.log('\nUser-Agent:');
-  console.log('  0) (default)');
-  console.log('  1) Custom');
-  console.log('  2) DD UA Test Codes');
-  const uaMode = (await ask('Enter number (default: 0): ')).trim() || '0';
-  let userAgent = null;
-
-  if (uaMode === '1') {
-    userAgent = (await ask('Enter custom User-Agent string: ')).trim();
-  } else if (uaMode === '2') {
-    console.log('\nDD UA Test Codes:');
-    const keys = Object.keys(UA_TEST_CODES);
-    keys.forEach((k, i) => console.log(`  ${i}) ${k}`));
-    const pick = (await ask('Pick number: ')).trim();
-    const idx = Math.max(0, Math.min(keys.length - 1, /^\d+$/.test(pick) ? Number(pick) : 0));
-    const chosen = keys[idx];
-    // Use the code itself as UA string (sites look for substrings)
-    userAgent = chosen;
-    console.log(pc.gray(`Selected: ${chosen}`));
-  }
-
-  // Finish mode
-  console.log('\nFinish mode:');
-  console.log('  0) Auto (network idle + 5s)');
-  console.log('  1) Manual (press Enter)');
-  const f = (await ask('Enter number (default: 0): ')).trim() || '0';
-  const finishMode = (f === '1') ? 'manual' : 'auto';
-
-  // URL
-  let urlInput = (await ask('\nWhich website do you want to open? ')).trim();
+async function askUrl(rl) {
   while (true) {
-    const normalized = normalizeInputURL(urlInput);
-    try {
-      new urlLib.URL(normalized);
-      urlInput = normalized.endsWith('/') ? normalized : normalized + '/';
-      break;
-    } catch {
-      console.log(pc.red('❌ Invalid URL. Please try again (example: leboncoin.fr or https://leboncoin.fr).'));
-      urlInput = (await ask('\nWhich website do you want to open? ')).trim();
-    }
-  }
-
-  return { browserKind, headless, userAgent, finishMode, url: urlInput };
-}
-
-// ========================= Main =========================
-(async () => {
-  const { browserKind, headless, userAgent, finishMode, url } = await promptUser();
-
-  // Create output dirs
-  const tstamp = new Date().toISOString().replace(/[:-]/g, '').replace(/\..+/, '');
-  const host = new urlLib.URL(url).hostname;
-  const sessionDir = path.join(process.cwd(), 'har', `${tstamp}_${host}`);
-  fs.mkdirSync(sessionDir, { recursive: true });
-
-  // Session recap
-  console.log('\n' + cSection('🧾 Run Recap'));
-  console.log('  ' + cSubhead('Timestamp') + ' : ' + new Date().toISOString());
-  console.log('  ' + cSubhead('URL') + '       : ' + url);
-  console.log('  ' + cSubhead('Browser') + '   : ' + { chromium: 'Chromium', firefox: 'Firefox', webkit: 'WebKit' }[browserKind]);
-  console.log('  ' + cSubhead('Headless') + '  : ' + (headless ? 'Yes' : 'No'));
-  console.log('  ' + cSubhead('Egress IP') + ' : ' + '(detects by site; not pre-fetched)');
-  console.log('  ' + cSubhead('User-Agent') + ': ' + (userAgent || '(default)'));
-  console.log('  ' + cSubhead('Session') + '   : ' + sessionDir);
-  const harPath = path.join(sessionDir, `${tstamp}_${host}.har`);
-  const cookiesPath = path.join(sessionDir, `${tstamp}_${host}.cookies.json`);
-  console.log('  ' + cSubhead('HAR') + '       : ' + harPath);
-  console.log('  ' + cSubhead('Cookies') + '   : ' + cookiesPath);
-  console.log('  ' + cSubhead('Finish') + '    : ' + (finishMode === 'auto' ? 'auto on network idle + 5s' : 'manual (press Enter)'));
-
-  const targetDomain = toRegistrable(host);
-
-  // Launch proper browser
-  const browsers = { chromium, firefox, webkit };
-  const launch = browsers[browserKind];
-
-  const contextOpts = {
-    userAgent: userAgent || undefined,
-    recordHar: {
-      path: harPath,
-      mode: 'full',
-      content: 'embed',
-    },
-    ignoreHTTPSErrors: true,
-  };
-
-  // Note: headless is a page-level option in launch()
-  const browser = await launch.launch({ headless });
-  const context = await browser.newContext(contextOpts);
-  const page = await context.newPage();
-
-  // Local state for capture
-  const captured = []; // { id, ts, method, url, status, resourceType, reqHeaders, resHeadersArray, reqBody, tag?, isTarget?, hostname }
-  const byRequestId = new Map(); // req → idx
-  const inlinedAfter403 = new Set(); // entries that we already printed as "Next after 403"
-
-  let initialDocumentRequest = null;
-  let initialChain = []; // sequence of DOCUMENT responses starting from first navigation
-  let main403Idx = -1;
-
-  // Shield against page closing mid-iteration
-  async function safeHeadersArray(response) {
-    try {
-      const arr = await response.headersArray();
-      return Array.isArray(arr) ? arr : [];
-    } catch {
-      return [];
-    }
-  }
-
-  page.on('request', (request) => {
-    try {
-      const urlStr = request.url();
-      const hostname = (new urlLib.URL(urlStr)).hostname;
-
-      // store doc/xhr/fetch only and exclude static assets
-      const rt = request.resourceType();
-      if (!(rt === 'document' || rt === 'xhr' || rt === 'fetch')) return;
-      if (isStaticAsset(urlStr)) return;
-
-      const id = request._guid || `${request.method()} ${urlStr} ${Date.now()} ${Math.random()}`; // best-effort identity
-      const entry = {
-        id,
-        ts: Date.now(),
-        method: request.method(),
-        url: urlStr,
-        status: null,
-        resourceType: rt.toUpperCase(),
-        reqHeaders: request.headers(),
-        resHeadersArray: [],
-        reqBody: (request.method() !== 'GET') ? parseBody(request) : null,
-        tag: challengeTagForURL(urlStr),
-        isTarget: isOnTargetOrChallenge(hostname, targetDomain),
-        hostname,
-      };
-      byRequestId.set(request, captured.length);
-      captured.push(entry);
-
-      if (rt === 'document' && !initialDocumentRequest) {
-        initialDocumentRequest = request;
-      }
-    } catch { /* ignore */ }
-  });
-
-  page.on('response', async (response) => {
-    // Match response to request
-    try {
-      const request = response.request();
-      const idx = byRequestId.get(request);
-      // Ignore if not in our map (filtered out earlier)
-      if (idx === undefined) return;
-
-      const arr = await safeHeadersArray(response);
-
-      captured[idx].resHeadersArray = arr;
-      captured[idx].status = response.status();
-
-      // Build initial chain (DOCUMENT only)
-      if (request.resourceType() === 'document') {
-        initialChain.push({
-          url: request.url(),
-          status: response.status(),
-          headersArray: arr
-        });
-      }
-    } catch { /* ignore */ }
-  });
-
-  console.log('\n' + cInfo('Launching browser… capturing network. ') + (finishMode === 'auto' ? '' : cDim('(Manual finish)')));
-  // Navigate
-  let mainResponse = null;
-  try {
-    mainResponse = await page.goto(url, { waitUntil: 'domcontentloaded' });
-  } catch (e) {
-    console.log(cError(`Navigation error: ${e.message}`));
-  }
-
-  // Finish mode handling
-  if (finishMode === 'manual') {
-    await ask(pc.gray('\nPress Enter to stop capture… '));
-  } else {
-    // network idle + 5s
-    try {
-      await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
-      await page.waitForTimeout(5000);
-    } catch {}
-  }
-
-  // Persist cookies
-  try {
-    const cookies = await context.cookies();
-    fs.writeFileSync(cookiesPath, JSON.stringify(cookies, null, 2));
-  } catch {}
-
-  // Close HAR recording
-  try {
-    await context.close(); // ensures HAR is flushed
-  } catch {}
-
-  // ========================= Printing =========================
-
-  // INITIAL REQUEST + REDIRECTS (DOCUMENT chain)
-  console.log('\n' + cSection('📍 Initial request & redirects'));
-  if (initialChain.length === 0 && mainResponse) {
-    // Fallback: single main response
-    const s = mainResponse.status();
-    const h = await safeHeadersArray(mainResponse);
-    console.log(`→ Requested: ${cURL(url)} [${cStatus(s)}]`);
-    const dd = parseDataDomeFromSetCookie(h);
-    if (dd) printDataDome(dd, '   ');
-  } else if (initialChain.length > 0) {
-    // Print first
-    const first = initialChain[0];
-    console.log(`→ Requested: ${cURL(first.url)} [${cStatus(first.status)}]`);
-    const dd0 = parseDataDomeFromSetCookie(first.headersArray || []);
-    if (dd0) {
-      printDataDome(dd0, '   ');
-    } else {
-      console.log('   ' + cDim('No DataDome Set-Cookie on this response.'));
-    }
-    // Print the redirects + terminal
-    for (let i = 1; i < initialChain.length; i++) {
-      const it = initialChain[i];
-      const label = `[${cStatus(it.status)}]`;
-      console.log(`   ↪ redirected to: ${cURL(it.url)} ${label}`);
-      const dd = parseDataDomeFromSetCookie(it.headersArray || []);
-      if (dd) printDataDome(dd, '   ');
-      if (it.status === 403 && main403Idx === -1) {
-        // mark that later when we print full capture we will connect "next after 403"
-        // We'll find the index in captured that matches this URL + document
-        const idx = captured.findIndex(
-          e => e.resourceType === 'DOCUMENT' && e.url === it.url && e.status === 403
-        );
-        main403Idx = idx;
-      }
-    }
-  } else {
-    console.log(cWarn('No initial DOCUMENT responses captured.'));
-  }
-
-  // Build a filtered, ordered list:
-  // Only target or challenge domains; only DOCUMENT/XHR/FETCH; exclude static assets (already excluded)
-  const list = captured
-    .filter(e => e.isTarget && (e.resourceType === 'DOCUMENT' || e.resourceType === 'XHR' || e.resourceType === 'FETCH'))
-    .sort((a, b) => a.ts - b.ts);
-
-  // Build a map from index to "next after 403" if any
-  const idxToNext = new Map(); // idx -> nextIdx
-  for (let i = 0; i < list.length; i++) {
-    const e = list[i];
-    if (e.status === 403 && e.resourceType === 'DOCUMENT') {
-      // find next chronological item
-      const next = list[i + 1];
-      if (next) {
-        idxToNext.set(i, i + 1);
-        inlinedAfter403.add(i + 1);
-      }
-    }
-  }
-
-  // ========================= FULL NETWORK CAPTURE =========================
-  console.log('\n' + cSection('📦 Full network capture (Document/XHR/Fetch on target or challenge domains)'));
-  let counter = 0;
-  for (let i = 0; i < list.length; i++) {
-    if (inlinedAfter403.has(i)) {
-      // skip duplicates already inlined under a 403 block
+    const raw = await rl.question(`\nWhich website or API endpoint do you want to open? `);
+    const s = raw.trim();
+    if (!s) {
+      output.write(
+        `${C.red("❌ Invalid URL.")} ${C.dim(
+          "Please try again (example: leboncoin.fr or https://leboncoin.fr)."
+        )}\n`
+      );
       continue;
     }
-    const e = list[i];
-    const statusLabel = (e.status === 403 ? cBlock() : cStatus(e.status || 0));
-    const tagStr = e.tag ? cTag(e.tag) : e.resourceType;
-    console.log(`  ${cCounter(++counter)}. ${tagStr} (${e.method}) → ${cURL(truncUrl(e.url))} [${statusLabel}]`);
-
-    // If response had DataDome set-cookie
-    const ddSet = parseDataDomeFromSetCookie(e.resHeadersArray || []);
-    if (ddSet) printDataDome(ddSet, '   ');
-
-    // Request headers of interest
-    const reqHeaders = e.reqHeaders || {};
-    const ddClient = reqHeaders['x-datadome-clientid'] || reqHeaders['X-Datadome-Clientid'] || reqHeaders['x-datadomeclientid'];
-    if (ddClient) {
-      console.log(`   ${cHeaderKey('x-datadome-clientid')}: ${cHeaderVal(ddClient)}`);
+    let url = s;
+    if (!/^https?:\/\//i.test(url)) url = "https://" + url;
+    try {
+      new URL(url);
+      return url;
+    } catch {
+      output.write(
+        `${C.red("❌ Invalid URL.")} ${C.dim(
+          "Please try again (example: leboncoin.fr or https://leboncoin.fr)."
+        )}\n`
+      );
     }
-    const cookieHeader = reqHeaders.cookie || reqHeaders.Cookie;
-    const ddReqCookie = findDataDomeInCookieHeader(cookieHeader);
-    if (ddReqCookie) {
-      console.log(`   ${cCookieKey('cookie.datadome')}: ${cCookieVal(ddReqCookie)}`);
-    }
+  }
+}
 
-    // Payload (query/body)
-    if (e.method === 'GET') {
-      const qp = parseQueryParams(e.url);
-      if (qp && Object.keys(qp).length) {
-        console.log('   ' + pc.bold('↳ Query params:'));
-        prettyPrintKV(qp);
+/* ==============================
+   Main
+============================== */
+(async () => {
+  const rl = readline.createInterface({ input, output });
+
+  // 1) What to test
+  const modeIdx = await askChoice(
+    rl,
+    "1/ Choose what to test",
+    ["GET a document/API", "POST a request to an API/Form"],
+    0
+  );
+  const modeLabel = modeIdx === 0 ? "GET (document/API)" : "POST (API/Form)";
+
+  // 2) Browser
+  const browserIdx = await askChoice(
+    rl,
+    "2/ Pick a browser engine",
+    ["Chromium", "Firefox", "WebKit"],
+    0
+  );
+  const engine = [chromium, firefox, webkit][browserIdx];
+  const engineLabel = ["Chromium", "Firefox", "WebKit"][browserIdx];
+
+  // 3) Headless
+  const headIdx = await askChoice(rl, "3/ Headless or headful", ["No", "Yes"], 0);
+  const headless = headIdx === 1;
+
+  // 4) UA selection
+  const uaIdx = await askChoice(
+    rl,
+    "4/ User-Agent selection",
+    ["Default", "Custom", "DD UA Test Codes"],
+    0
+  );
+  let userAgent = null;
+  let uaPresetLabel = "Default";
+  if (uaIdx === 1) {
+    const ans = await rl.question("\nEnter a custom User-Agent: ");
+    userAgent = ans.trim() || null;
+    uaPresetLabel = userAgent ? "Custom" : "Default";
+  } else if (uaIdx === 2) {
+    output.write(
+      `\nPick a DD UA Test Code:\n\n` +
+        `  0) BLOCKUA = CAPTCHA\n` +
+        `  1) BLOCKUAHARDBLOCKUA = CAPTCHA > Block\n` +
+        `  2) HARDBLOCK = Block\n` +
+        `  3) HARDBLOCK_UA = Block [Only on cross-origin XHR]\n` +
+        `  4) DeviceCheckTestUA = Device Check\n` +
+        `  5) DeviceCheckTestUA-BLOCKUA = Device Check > CAPTCHA\n` +
+        `  6) DeviceCheckTestUA-HARDBLOCK = Device Check > Block\n`
+    );
+    const pick = await rl.question(`Enter number (default: 0): `);
+    const n = pick.trim() === "" ? 0 : Number(pick.trim());
+    const codes = [
+      "BLOCKUA",
+      "BLOCKUAHARDBLOCKUA",
+      "HARDBLOCK",
+      "HARDBLOCK_UA",
+      "DeviceCheckTestUA",
+      "DeviceCheckTestUA-BLOCKUA",
+      "DeviceCheckTestUA-HARDBLOCK",
+    ];
+    const code = codes[n] || codes[0];
+    userAgent = `Mozilla/5.0 (DD-UA-Test ${code}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36`;
+    uaPresetLabel = `DD UA Test Codes (${code})`;
+  }
+
+  // 5) Network logging scope
+  const scopeIdx = await askChoice(
+    rl,
+    "5/ Network logging scope",
+    [
+      "Only same-domain requests (XHR/Fetch/Document)",
+      "Only cross-origin requests (XHR/Fetch/Document)",
+      "Any origin requests (XHR/Fetch/Document)",
+    ],
+    0
+  );
+  const scopeLabel =
+    scopeIdx === 0 ? "Same-domain only" : scopeIdx === 1 ? "Cross-origin only" : "Any origin";
+
+  // 6) Finish mode
+  const finishIdx = await askChoice(
+    rl,
+    "6/ Finish mode",
+    ["Auto (network idle + 5s)", "Manual (press Enter)"],
+    0
+  );
+  const finishLabel = finishIdx === 0 ? "auto on network idle + 5s" : "manual";
+
+  // 7) URL
+  const url = await askUrl(rl);
+  const targetHost = hostOf(url);
+  const baseHost = suffixBase(targetHost);
+
+  // POST payload (when applicable)
+  let postPayload = null;
+  if (modeIdx === 1) {
+    output.write(`\nEnter JSON payload for POST (single or multi-line; blank line to finish):\n`);
+    let buf = "";
+    while (true) {
+      const line = await rl.question("> ");
+      if (!line.trim()) break;
+      buf += line + "\n";
+    }
+    postPayload = buf.trim() ? buf : null;
+  }
+
+  // Session paths
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+  const sessionName = `${stamp}_${sanitizePart(targetHost)}`;
+  const baseDir = path.resolve(__dirname, "har", sessionName);
+  ensureDir(baseDir);
+  const harPath = path.join(baseDir, `${sessionName}.har`);
+  const cookiePath = path.join(baseDir, `${sessionName}.cookies.json`);
+
+  // Launch
+  const browser = await engine.launch({ headless });
+  const context = await browser.newContext({
+    userAgent: userAgent || undefined,
+    recordHar: { path: harPath, mode: "minimal" },
+    ignoreHTTPSErrors: true,
+  });
+  const page = await context.newPage();
+
+  // Resolve egress IP (best effort)
+  let egressIP = "(unknown)";
+  try {
+    const r = await context.request.get("https://api.ipify.org?format=json", { timeout: 10000 });
+    if (r.ok()) {
+      const j = await r.json();
+      if (j && j.ip) egressIP = j.ip;
+    }
+  } catch {}
+
+  // Scope matcher
+  function matchesScope(u) {
+    const h = hostOf(u);
+    if (DD_HOSTS.has(h)) return true; // ALWAYS include DataDome endpoints
+    if (scopeIdx === 2) return true; // any origin
+    if (scopeIdx === 0) return sameDomain(h, baseHost); // same
+    return !sameDomain(h, baseHost); // cross
+  }
+
+  // Capture store (structured, we will augment from HAR later)
+  const captured = []; // {i, url, method, status, type, ddLabel, reqHeaders, reqCookie, ddClientId, ddSetCookiesRuntime:[]}
+
+  // UNIVERSAL response listener at CONTEXT level
+  context.on("response", async (response) => {
+    try {
+      const req = response.request();
+      const rt = req.resourceType(); // document|xhr|fetch|...
+      if (!LOG_TYPES.has(rt)) return;        // Only our types
+      const urlStr = response.url();
+      if (isStatic(urlStr)) return;          // exclude static always
+      if (!matchesScope(urlStr)) return;
+
+      const h = hostOf(urlStr);
+      const ddLabel = classifyDD(urlStr);
+      const method = req.method();
+      const status = response.status();
+
+      // Request headers for datadome signals
+      let reqHeaders = {};
+      try { reqHeaders = req.headers(); } catch {}
+
+      const ddClientId = headerValueCase(reqHeaders, "x-datadome-clientid") || null;
+
+      // Request cookie datadome full value
+      const cookieHdr = headerValueCase(reqHeaders, "cookie") || headerValueCase(reqHeaders, "Cookie");
+      let reqCookieDatadome = null;
+      if (cookieHdr && /(^|;\s*)datadome=/i.test(cookieHdr)) {
+        const m = cookieHdr.match(/datadome=[^;]+/i);
+        reqCookieDatadome = m ? m[0] : "datadome=(present in Cookie header)";
       }
+
+      // RESPONSE Set-Cookie with datadome= (runtime)
+      const ddSetCookiesRuntime = getDataDomeSetCookies(response);
+
+      captured.push({
+        url: urlStr,
+        method,
+        status,
+        type: rt,
+        ddLabel,
+        ddClientId,
+        reqCookieDatadome,
+        ddSetCookiesRuntime,
+        ddAlways: h === "geo.captcha-delivery.com",
+        geoHost: h === "geo.captcha-delivery.com",
+        reqHasBody: false,
+        reqBody: null,
+      });
+
+      // For geo.captcha-delivery.com POST, store body (up to 4k)
+      if (h === "geo.captcha-delivery.com" && !/^get$/i.test(method)) {
+        try {
+          const body = req.postData();
+          if (body) {
+            captured[captured.length - 1].reqHasBody = true;
+            captured[captured.length - 1].reqBody = body.slice(0, 4000);
+          }
+        } catch {}
+      }
+    } catch {
+      // swallow
+    }
+  });
+
+  // Drive the action
+  try {
+    if (modeIdx === 0) {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
     } else {
-      if (e.reqBody != null) {
-        console.log('   ' + pc.bold('↳ Body:'));
-        if (typeof e.reqBody === 'string') {
-          console.log('     ' + cDim(e.reqBody));
-        } else {
-          prettyPrintKV(e.reqBody);
+      await page.goto("about:blank");
+      await page.evaluate(
+        async ({ u, bodyStr }) => {
+          const headers = { "content-type": "application/json" };
+          try {
+            await fetch(u, {
+              method: "POST",
+              headers,
+              body: bodyStr || "{}",
+              credentials: "include",
+              mode: "cors",
+            });
+          } catch {}
+        },
+        { u: url, bodyStr: postPayload }
+      );
+    }
+  } catch {
+    // Continue; logging still prints what we captured
+  }
+
+  // Finish policy
+  if (finishIdx === 0) {
+    try {
+      await page.waitForLoadState("networkidle", { timeout: 45000 });
+    } catch {}
+    await new Promise((r) => setTimeout(r, 5000));
+  } else {
+    await rl.question(`\nPress ${C.bold("Enter")} to finish logging…`);
+  }
+
+  // Save cookies for reference
+  try {
+    const ck = await context.cookies();
+    fs.writeFileSync(cookiePath, JSON.stringify(ck, null, 2), "utf8");
+  } catch {}
+
+  // Close browser to flush HAR to disk before we read it.
+  await context.close();
+  await browser.close();
+
+  // === AUGMENT FROM HAR (to guarantee DataDome Set-Cookie visibility) ===
+  let harEntries = [];
+  try {
+    const harRaw = fs.readFileSync(harPath, "utf8");
+    const har = JSON.parse(harRaw);
+    harEntries = (har?.log?.entries || []).map((e, idx) => ({
+      idx,
+      reqUrl: e?.request?.url || "",
+      reqMethod: e?.request?.method || "",
+      respStatus: e?.response?.status ?? 0,
+      reqHeaders: e?.request?.headers || [],
+      respHeaders: e?.response?.headers || [],
+      used: false,
+    }));
+  } catch {
+    // no HAR or unreadable
+  }
+
+  // helper: find first unused HAR entry that matches url+method+status (exact)
+  function findHarFor(item) {
+    for (const e of harEntries) {
+      if (e.used) continue;
+      if (e.reqUrl === item.url && e.reqMethod === item.method && e.respStatus === item.status) {
+        e.used = true;
+        return e;
+      }
+    }
+    // relaxed fallback: same url+method, ignore status
+    for (const e of harEntries) {
+      if (e.used) continue;
+      if (e.reqUrl === item.url && e.reqMethod === item.method) {
+        e.used = true;
+        return e;
+      }
+    }
+    return null;
+  }
+
+  // augment each captured line with HAR-derived cookie details if runtime missed them
+  for (const item of captured) {
+    const har = findHarFor(item);
+    if (!har) continue;
+
+    // request Cookie header datadome
+    if (!item.reqCookieDatadome && Array.isArray(har.reqHeaders)) {
+      const cookieH = har.reqHeaders.find((h) => h?.name?.toLowerCase() === "cookie")?.value || "";
+      const m = cookieH.match(/datadome=[^;]+/i);
+      if (m) item.reqCookieDatadome = m[0];
+    }
+    // request x-datadome-clientid
+    if (!item.ddClientId && Array.isArray(har.reqHeaders)) {
+      const ddh = har.reqHeaders.find((h) => h?.name?.toLowerCase() === "x-datadome-clientid");
+      if (ddh?.value) item.ddClientId = ddh.value;
+    }
+    // response Set-Cookie: datadome (full values)
+    if ((!item.ddSetCookiesRuntime || item.ddSetCookiesRuntime.length === 0) && Array.isArray(har.respHeaders)) {
+      const setc = har.respHeaders
+        .filter((h) => h?.name?.toLowerCase() === "set-cookie" && /datadome=/i.test(h?.value || ""))
+        .map((h) => h.value);
+      if (setc.length) item.ddSetCookiesRuntime = setc; // reuse field name for printing
+    }
+  }
+
+  // Recap + FULL CAPTURE ONLY (print AFTER augmentation so cookies appear right under the line)
+  output.write(
+    `\n${C.bold("🧾 Run Recap")}\n${"".padEnd(112, "—")}\n` +
+      `  Timestamp:             ${nowISO()}\n` +
+      `  URL:                   ${url}\n` +
+      `  What to test:          ${modeLabel}\n` +
+      `  Browser:               ${engineLabel}\n` +
+      `  Headless:              ${headless ? "Yes" : "No"}\n` +
+      `  User-Agent:            ${uaPresetLabel}\n` +
+      `  Egress IP:             ${egressIP}\n` +
+      `  Network logging scope: ${scopeLabel}\n` +
+      `  Session:               ${baseDir}\n` +
+      `  HAR:                   ${path.join(baseDir, `${sessionName}.har`)}\n` +
+      `  Cookies:               ${cookiePath}\n` +
+      `  Finish:                ${finishLabel}\n\n` +
+      `Launching browser… capturing network. \n\n`
+  );
+
+  const scopeTitle =
+    scopeIdx === 0 ? "same-domain only" : scopeIdx === 1 ? "cross-origin only" : "any origin";
+  output.write(
+    `${C.bold(
+      `📦 Full network capture (XHR/Fetch/Document • ${scopeTitle} • static assets excluded)`
+    )}\n${"".padEnd(112, "—")}\n`
+  );
+
+  if (!captured.length) {
+    output.write(`  ${C.dim("No capture entries.")}\n`);
+  } else {
+    let printedIdx = 0;
+    for (const it of captured) {
+      printedIdx += 1;
+      const typeStr = prettyType(it.type, it.ddLabel);
+      output.write(
+        `  ${pad2(printedIdx)}. ${typeStr} (${it.method}) → ${it.url} [${prettyStatus(it.status)}]\n`
+      );
+
+      // Request header: x-datadome-clientid
+      if (it.ddClientId) {
+        output.write(`      ↳ Request header ${C.cyan("x-datadome-clientid")}: ${it.ddClientId}\n`);
+      }
+
+      // Request Cookie: datadome=...
+      if (it.reqCookieDatadome) {
+        output.write(`      ↳ Request cookie ${C.cyan(it.reqCookieDatadome)}\n`);
+      }
+
+      // Response Set-Cookie (DataDome) — FULL VALUE(S)
+      if (Array.isArray(it.ddSetCookiesRuntime) && it.ddSetCookiesRuntime.length) {
+        output.write(`      🍪 DataDome Set-Cookie:\n`);
+        for (const sc of it.ddSetCookiesRuntime) {
+          output.write(`        ${sc}\n`);
         }
       }
-    }
 
-    // For a 403 DOCUMENT, inline the very next request if present
-    if (e.status === 403 && e.resourceType === 'DOCUMENT') {
-      const nextIdx = idxToNext.get(i);
-      if (typeof nextIdx === 'number') {
-        const n = list[nextIdx];
-        const nstatus = (n.status === 403 ? cBlock() : cStatus(n.status || 0));
-        const nlabel = n.tag ? cTag(n.tag) : (n.resourceType || '');
-        console.log(`     ↪ Next request after 403: ${nlabel} (${n.method}) → ${cURL(truncUrl(n.url))} [${nstatus}]`);
-
-        const ddSetN = parseDataDomeFromSetCookie(n.resHeadersArray || []);
-        if (ddSetN) printDataDome(ddSetN, '       ');
-
-        const reqHeadersN = n.reqHeaders || {};
-        const ddClientN = reqHeadersN['x-datadome-clientid'] || reqHeadersN['X-Datadome-Clientid'] || reqHeadersN['x-datadomeclientid'];
-        if (ddClientN) console.log(`       ${cHeaderKey('x-datadome-clientid')}: ${cHeaderVal(ddClientN)}`);
-        const cookieHeaderN = reqHeadersN.cookie || reqHeadersN.Cookie;
-        const ddReqCookieN = findDataDomeInCookieHeader(cookieHeaderN);
-        if (ddReqCookieN) console.log(`       ${cCookieKey('cookie.datadome')}: ${cCookieVal(ddReqCookieN)}`);
-
-        if (n.method === 'GET') {
-          const qpN = parseQueryParams(n.url);
-          if (qpN && Object.keys(qpN).length) {
-            console.log('       ' + pc.bold('↳ Query params:'));
-            prettyPrintKV(qpN, '         ');
+      // geo.captcha-delivery.com: show params/body
+      const host = hostOf(it.url);
+      if (host === "geo.captcha-delivery.com") {
+        if (/^get$/i.test(it.method)) {
+          const qp = parseQuery(it.url);
+          if (qp && Object.keys(qp).length) {
+            output.write(`      ↳ Query params:\n`);
+            const indented = j2(qp).replace(/\n/g, "\n        ");
+            output.write(`        ${indented}\n`);
           }
-        } else {
-          if (n.reqBody != null) {
-            console.log('       ' + pc.bold('↳ Body:'));
-            if (typeof n.reqBody === 'string') {
-              console.log('         ' + cDim(n.reqBody));
-            } else {
-              prettyPrintKV(n.reqBody, '         ');
-            }
-          }
+        } else if (it.reqHasBody && it.reqBody) {
+          output.write(`      ↳ Body:\n`);
+          output.write(`        ${it.reqBody.replace(/\n/g, "\n        ")}\n`);
         }
       }
     }
   }
 
-  // ========================= SAVED PATHS =========================
-  console.log('\n' + cSection('📦 Saved:'));
-  console.log('  ' + cSubhead('HAR:') + '     ' + harPath);
-  console.log('  ' + cSubhead('Cookies:') + ' ' + cookiesPath);
+  output.write(
+    `\n${C.bold("📦 Saved:")}\n${"".padEnd(112, "—")}\n` +
+      `  HAR:                   ${path.join(baseDir, `${sessionName}.har`)}\n` +
+      `  Cookies:               ${cookiePath}\n`
+  );
 
-  console.log('\n' + pc.bold(pc.green('✅ Done')));
-  rl.close();
+  output.write(`\n${C.green("✅ Done")}\n`);
 })().catch((err) => {
-  console.error(cError(err?.stack || String(err)));
-  try { rl.close(); } catch {}
+  console.error(`${C.red("Unexpected error:")} ${err?.message || err}`);
   process.exit(1);
 });

@@ -1,0 +1,41 @@
+Your Core Requirements
+	1.	Prompt-driven setup
+	•	Choose what to test (GET document/API or POST request with payload).
+	•	Select browser (Chromium, Firefox, or WebKit).
+	•	Decide Headless / Headful.
+	•	Pick User-Agent (default, custom, or DD test UAs).
+	•	Select network logging scope:
+	•	Same-domain only
+	•	Cross-origin only
+	•	Any origin
+	•	Choose finish mode (auto or manual).
+	•	Enter a URL (validated until correct).
+	2.	Network capture rules
+	•	Only log Document, XHR, Fetch requests.
+	•	Never log static assets (css, js, images, fonts, videos, etc).
+	•	Always include geo.captcha-delivery.com (CAPTCHA/BLOCK, Device Check) requests — both GET and POST.
+	•	Show sequential flow:
+	•	A request → if blocked (403) → log the immediate follow-up request (captcha or device check).
+	3.	What to log for each request
+	•	URL, method, status code (colorized).
+	•	Classification (CAPTCHA/BLOCK, Device Check, Challenge).
+	•	Query params (for GET).
+	•	Payload/body (for POST/PUT).
+	•	Request headers: show x-datadome-clientid if present.
+	•	Request cookies: show full datadome cookie value if present.
+	•	Response headers: show full datadome Set-Cookie value(s), with domain/path/flags.
+	4.	Output sections
+	•	Run Recap: all choices + environment info (timestamp, URL, what to test, browser, headless, UA, egress IP, logging scope, HAR/cookie file paths).
+	•	Full Network Capture: sequential listing of all relevant requests with the above details.
+	•	Saved files: HAR + cookies file paths.
+	5.	Reliability
+	•	Should capture everything reliably, even if redirects or captcha/device-check sequences happen.
+	•	Should handle sequential challenge steps clearly (403 → interstitial → captcha).
+	•	Should work on all three engines (Chromium, Firefox, WebKit).
+	•	Should always show datadome cookies if they exist (using HAR fallback if Playwright response doesn’t expose them directly).
+	6.	Presentation
+	•	Modern, colorized logging.
+	•	Clean sections, no duplication.
+	•	Easy to read sequential story of what happened.
+
+⸻
